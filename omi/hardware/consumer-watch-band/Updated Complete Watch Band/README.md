@@ -24,3 +24,7 @@ After having printed the model, buckle and unbuckle the clasp at least 10 times 
 
 Finally, enjoy!
 
+
+## Pre-sized file: 20cm wrist
+
+`Omi Watch Band - 28 links (20cm wrist).3mf` is the stock project extended from 17 to 28 links (14 per side), per the formula above: (20 - 5.8) / 0.544 = 26.1, rounded up to 27, plus 1 = 28. Added links reuse the original link spacing. Total length is about 240mm, so it fits a 256mm bed lengthwise.
