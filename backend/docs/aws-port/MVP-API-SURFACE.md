@@ -106,7 +106,7 @@ task-integration and integration loads (lines 431-451).
 | Method and path | Client caller | Backend handler | Store / providers | MVP |
 | --- | --- | --- | --- | --- |
 | `GET /v1/account/cutover/control` | `services/account_cutover/account_cutover_control_client.dart:62-63` `_defaultFetch`, via `AccountCutoverRuntime.bindAuthenticatedOwner` (`account_cutover_runtime.dart:129`), called at `main.dart:383-387` and on resume | `routers/account_cutover.py:19` `get_account_cutover_control` | `users/{uid}/account_cutover/state` (`database/account_cutover.py`), with a Redis epoch key. A missing document means legacy-compatible. A malformed one fails closed | in. Startup blocks on it |
-| `GET /v1/health` | `services/connectivity_service.dart:193`, the connectivity probe on non-production profiles | `routers/other.py:8` | None | in. The fork's build profile is non-production, so this replaces the public probes |
+| `GET /v1/health` | `services/connectivity_service.dart:193`, the connectivity probe on non-production profiles | `routers/other.py:8` | None | in. Whether the fork's release build counts as non-production is `UNVERIFIED`. The route is served either way |
 | `GET /v1/users/deletion-status` | `backend/http/api/account_deletion.dart` `status()`, via `providers/auth_provider.dart:79` `checkAccountDeletion`, awaited at `core/app_shell.dart:427` | `routers/account_deletion.py:76`, then `services/users/account_deletion.py:769` | `account_deletions/{uid}` marker (`database/account_deletion_marker.py:95`), the held-audio summary, and the processing backlog (`database/processing_backlog.py:43`) | in. Startup aborts on failure |
 | `GET /v1/users/available-languages` | `users.dart:519`, via `providers/home_provider.dart:257` `loadLanguagesThenSetupPrimary`, called at `app_shell.dart:434` | `routers/users.py:924` | None. Returns the static `PRIMARY_LANGUAGE_OPTIONS` | in |
 | `GET /v1/users/private-cloud-sync` | `users.dart:328`, via `providers/user_provider.dart:178` `initialize`, called at `app_shell.dart:435` | `routers/users.py:652` | `users/{uid}` (private-cloud-sync flag) | in |
@@ -128,6 +128,20 @@ task-integration and integration loads (lines 431-451).
 | `GET /v3/speech-profile` | `backend/http/api/speech_profile.dart:18` `userHasSpeakerProfile`, called from `home_provider.dart:242` | `routers/speech_profile.py:62` | S3 `BUCKET_SPEECH_PROFILES` object `{uid}/speech_profile.wav` exists (`utils/other/storage.py:319`). Returns `false` when the bucket is unset | in |
 | `POST /v1/users/client-state` | `services/sockets/listen_client_state.dart:104` | `routers/users.py:2793` | Redis sorted sets and keys under `demand-processing:v1:` (`utils/conversations/demand_processing.py::observe_surface`). The prefix needs `OMI_ENV_STAGE` set | in |
 | `POST /v1/users/fcm-token` | `notifications.dart:18` `saveFcmTokenServer`, called only from the FCM service | `routers/notifications.py:35` | `u/fcm_tokens` | cut. Route disabled by `OMI_DISABLED_ROUTES`. The client `NotificationService` becomes a no-op, so the call at `app_shell.dart:453` sends nothing |
+
+**First-run onboarding.** The release arm is Pocket
+(`services/experiments/onboarding_variant_gate.dart:109`). Its steps are
+permissions, pairing, found-Omi, primary language and name
+(`pages/onboarding/variants/pocket/pocket_onboarding_flow.dart`). It calls
+`PATCH /v1/users/language` and `PATCH /v1/users/onboarding` (through
+`services/onboarding_sync_runtime.dart:18`), both in the rows above, and the
+`POST /v1/onboarding/seed-conversation` string, which has no backend route and
+is tolerated (see "No backend route"). The sign-up trial paywall and the
+end-of-onboarding paywall both return early in `PaywallRouter.openVariant`
+when `showSubscriptionUI` is false (`pages/paywall/paywall_router.dart:30`).
+The seeded owner is a marketplace reviewer, so the subscription response sets
+it false (`routers/users.py:1437-1456`). The other onboarding arms, including
+guided voice and the knowledge-graph prebuild, are debug-only.
 
 ### Home
 
@@ -200,7 +214,7 @@ serves only the firmware manifest.
 
 | Method and path | Client caller | Backend handler | Store / providers | MVP |
 | --- | --- | --- | --- | --- |
-| `GET /v2/firmware/latest` | `backend/http/api/device.dart:16` `getLatestFirmwareVersion`, called from `pages/home/firmware_mixin.dart:396` and `providers/device_provider.dart:1105` | `routers/firmware.py:360` | GitHub Releases API for `BasedHardware/omi` (`utils/github_releases.py`), cached in Redis with a last-known-good key. Optional `GITHUB_TOKEN` | in |
+| `GET /v2/firmware/latest` | `backend/http/api/device.dart:9` `latestFirmwareVersionUri`, used by `getLatestFirmwareVersion` (27), called from `pages/home/firmware_mixin.dart:396` and `providers/device_provider.dart:1105` | `routers/firmware.py:360` | GitHub Releases API for `BasedHardware/omi` (`utils/github_releases.py`), cached in Redis with a last-known-good key. Optional `GITHUB_TOKEN` | in |
 | `GET /v2/firmware/stable?device_model=…` | `device.dart:56` `getStableFirmwareVersion`, called from `firmware_mixin.dart:412` and `device_provider.dart:1504` | `routers/firmware.py:408` | Same as above | in |
 
 ## 3. Live capture
@@ -256,8 +270,8 @@ JSON segment and event messages.
 
 | Method and path | Client caller | Backend handler | Store / providers | MVP |
 | --- | --- | --- | --- | --- |
-| `GET /v1/conversations?limit&offset&statuses&include_discarded` | `conversations.dart:513` `getConversationsResult`, called from `providers/conversation_home_fetch.dart:124` | `routers/conversations.py:963` `get_conversations` | `u/conversations`, ordered by `created_at`, via `conversations_db.get_conversations_without_photos` | in |
-| `GET /v1/conversations/{conversation_id}` | `conversations.dart:588` `getConversationById`, called from `pages/conversation_detail/conversation_detail_provider.dart:87` and `widgets/summary_tab.dart:71` | `routers/conversations.py:1136` | `u/conversations/{id}` | in |
+| `GET /v1/conversations?limit&offset&statuses&include_discarded` | `conversations.dart:513` `conversationCollectionUrl`, used by `getConversationsResult` (100), called from `providers/conversation_home_fetch.dart:124` | `routers/conversations.py:963` `get_conversations` | `u/conversations`, ordered by `created_at`, via `conversations_db.get_conversations_without_photos` | in |
+| `GET /v1/conversations/{conversation_id}` | `conversations.dart:440` `getConversationByIdResult`, used by `getConversationById` (496). `ConversationApi.byId` (585) is a second caller, called from `pages/conversation_detail/conversation_detail_provider.dart:87` and `widgets/summary_tab.dart:71` | `routers/conversations.py:1136` | `u/conversations/{id}` | in |
 | `POST /v1/conversations` (process the in-progress conversation now) | `conversations.dart:48` `processInProgressConversationOutcome`, called from `services/capture/capture_controller.dart:4186` | `routers/conversations.py:503` | `lifecycle_service.admit_processing`, then the finalization chain of section 3 steps 8 and 9. Redis cached geolocation | in |
 | `POST /v1/conversations/{conversation_id}/reprocess` | `conversations.dart:235` `reProcessConversationServer`, called from `conversation_detail_provider.dart:86` and `pages/activity/needs_attention_section.dart:277` | `routers/conversations.py:759` | `u/conversations/{id}`, then `process_conversation` (LLM features above, `u/memory_items`). Hourly limit in Redis | in |
 | `PATCH /v1/conversations/{conversation_id}/title?title=…` | `conversations.dart:641` `updateConversationTitle`, called from `conversation_detail_provider.dart:1008` | `routers/conversations.py:1194` | `u/conversations/{id}` (`title`) | in |
@@ -396,7 +410,7 @@ switch, who enforces it, and the response a client gets.
 | Push | `POST /v1/users/fcm-token` | `OMI_DISABLED_ROUTES` `POST /v1/users/fcm-token` |
 | Offline and SD-card sync upload | `POST /v2/sync-capture-manifest`, `POST /v1/sync-local-files`, `POST /v2/sync-local-files`, `POST /v2/sync-local-files/{job_id}/release-hold`, `GET /v2/sync-local-files/{job_id}` | `OMI_DISABLED_ROUTES`, one entry each. The WAL keeps audio on 404 |
 | Search | `POST /v1/conversations/search` | `OMI_DISABLED_ROUTES` `POST /v1/conversations/search` |
-| Apps and plugins | `/v1/apps*`, `/v2/apps*`, `/v1/app/*`, `/v1/app-*`, app reviews and keys, `/v1/dev/*` | `OMI_DISABLED_ROUTERS=apps,developer,developer_key` |
+| Apps and plugins | `/v1/apps*`, `/v2/apps*`, `/v1/app/*`, `/v1/app-*`, app reviews and keys, `/v1/dev/user/*` (the `developer` module, which includes `developer_read`) | `OMI_DISABLED_ROUTERS=apps,developer,developer_key`. The developer key routes (`/v1/dev/keys*`, `api_key_management`) stay mounted and are not reached |
 | Billing | `/v1/payments/*`, `/v1/stripe/*`, `/v1/payment-methods/*`, `/v1/paypal/*`, `/v1/apps/{app_id}/subscription`, retention offer, yearly switch, redeem code, `/v2/payments/plans` | `OMI_DISABLED_ROUTERS=payment,retention_offer,yearly_switch,redeem_code,storefront`. `GET /v1/users/me/subscription` stays in |
 | Google Calendar and X | `/v1/calendar/google/*`, `/v1/calendar/capture-gaps`, `/v1/calendar/onboarding/*`, `/v1/calendar/meetings*`, `/v1/x/*` | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,calendar_meetings,x_connector` |
 | Calendar links on conversations | `POST /v1/conversations/{conversation_id}/calendar-event`, `DELETE /v1/conversations/{conversation_id}/calendar-event`, `POST /v1/conversations/{conversation_id}/calendar-event/auto-link` | `OMI_DISABLED_ROUTES`, one entry each. These live in the retained `conversations` module |
