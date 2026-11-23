@@ -63,15 +63,18 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | GCS buckets | S3, one bucket per `BUCKET_*` env var, behind a new `S3StorageClient` | One shared bucket with prefixes (breaks per-bucket lifecycle and IAM scoping that the env-var split already implies) | `utils/other/local_storage.py::create_storage_client` (line 348), plus direct `google.cloud.storage` importers listed below | No |
 | Cloud Tasks (finalization dispatch) | Inline dispatch to a pusher sidecar for MVP. SQS is the post-MVP queue | Step Functions (heavier than a FIFO work queue for one user) | `utils/pusher.py` (`HOSTED_PUSHER_API_URL`), `routers/listen/conversations.py::schedule_finalization` (330) | No |
 | Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py::redis_connection_kwargs` (line 9) gains an `ssl` kwarg | No |
-| Soniox / Modulate streaming STT | Amazon Transcribe streaming, as a new `STTService.transcribe` and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | `utils/stt/streaming.py::STTService` (122), `config/stt_provider_policy.py::DEFAULT_MODELS_BY_SURFACE` (145) | No |
+| Soniox / Modulate streaming STT | Amazon Transcribe streaming over a raw SigV4 WebSocket on Python 3.11, as a new `transcribe` provider and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | The closed STT policy seams listed under "STT: seam contract" | No |
 | OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `bedrock` provider), `utils/llm/clients.py::get_llm` (762), `utils/llm/model_config.py` (new `MODEL_QOS` profile) | No |
 | OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings` | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) | No |
+| OpenAI Files (chat attachments) | S3 `BUCKET_CHAT_FILES` for the bytes, sent to Bedrock Converse as image and document content blocks | Keeping OpenAI Files (not an AWS service, and a second LLM vendor for one feature) | `utils/other/chat_file.py` `FileChatTool.upload` (249), `upload_video`, `_ask_files_stream` (397), `_ask_files` (462), `download_owned_chat_file` (115) | No |
+| Gemini / ElevenLabs TTS (`/v2/tts/synthesize`) | Cut for MVP. Amazon Polly later | Polly now (the client already falls back to the system voice) | `routers/tts.py` | No |
 | Pinecone (conversation vectors) | Cut for MVP. pgvector on the same Aurora cluster later | OpenSearch Serverless (OCU minimum is a standing cost for one user) | `database/vector_db.py` (`PINECONE_API_KEY`/`PINECONE_INDEX_NAME` at 144-155) | No |
 | Typesense (conversation search) | Cut for MVP. Postgres full-text search later | OpenSearch managed domain (standing instance cost) | `utils/conversations/search.py::search_conversations` (342) | No |
-| Firebase Cloud Messaging push | Cut for MVP. SNS mobile push to APNs later | Amazon Pinpoint (end of support 2026-10-30) | New `OMI_PUSH_PROVIDER` seam in `utils/notifications.py` | No |
+| Firebase Cloud Messaging push | Cut for MVP via `OMI_DISABLED_ROUTES` (see "Cut switches"). SNS mobile push to APNs later | Amazon Pinpoint (end of support 2026-10-30) | `POST /v1/users/fcm-token` (`routers/notifications.py:35`), `utils/notifications.py` | No |
 | GitHub Releases (firmware manifest) | Kept as is. Not GCP | S3 mirror of firmware binaries (duplicates a public source that already has a Redis LKG cache) | `utils/github_releases.py` | n/a |
 | Secret Manager / env files | AWS Secrets Manager, injected as ECS task secrets | SSM Parameter Store SecureString (no managed rotation for the RDS secret) | ECS task definition `secrets` | n/a |
 | GKE / Cloud Run hosting | ECS Fargate behind an ALB | App Runner (no WebSocket support) | Container image from `backend/Dockerfile` and `backend/pusher/Dockerfile` | n/a |
+| Base image `gcr.io/based-hardware-dev/python:3.11-slim-forky` (`backend/Dockerfile:1`, `backend/pusher/Dockerfile:1`) | `public.ecr.aws/docker/library/python:3.11-slim`, passed as the existing `PYTHON_BASE_IMAGE` build arg | Mirroring the GCR image into ECR (keeps a private upstream image the fork cannot rebuild) | `PYTHON_BASE_IMAGE` build arg | n/a |
 | Cloud KMS | Not on the MVP path. `utils/other/space_keys.py` serves the object lake only | n/a | n/a | n/a |
 
 Direct `google.cloud.storage` importers that must route through the storage
@@ -210,13 +213,84 @@ ap-southeast-4, which is cross-region from the ap-southeast-2 task.
 Do not reuse the existing `AppClient`. It allows the implicit grant and an
 admin scope. Callback schemes are registered in
 `app/android/app/src/{dev,prod}/AndroidManifest.xml` and through
-`AUTH_CALLBACK_SCHEME` in the iOS xcconfigs and `Info.plist`. The client seam is
-`app/lib/services/auth_service.dart`: `authenticateWithProvider`,
-`_exchangeCodeForOAuthCredentials`, and `refreshIdToken`/`getIdToken`. Its
-existing PKCE and `app_links` flow is re-pointed at the hosted UI endpoints
-above. Risk: the `omi://` scheme collides with the official Omi app if both are
-installed on one device. The fork can switch to a distinct scheme by changing
-the three callback values.
+`AUTH_CALLBACK_SCHEME` in the iOS xcconfigs and `Info.plist`. Risk: the `omi://`
+scheme collides with the official Omi app if both are installed on one device.
+The fork can switch to a distinct scheme by changing the three callback values.
+
+### Auth: client session migration
+
+FirebaseAuth is a process-wide identity boundary in the app, not a detail of
+`auth_service.dart`. Startup restore, account switching, outbox ownership,
+background work, token refresh and sign-out all read `FirebaseAuth.instance`
+directly. Repointing only the sign-in call would leave those bound to Firebase,
+and the sign-in methods return Firebase `UserCredential`, which cannot carry a
+Cognito session.
+
+**Decision.** Widen the existing provider-neutral seam instead of adding a
+second one. `AuthTokenGateway` (`services/auth/auth_token_result.dart:80`)
+already exposes `currentUser` as an `AuthUserSnapshot` (60), `forceRefresh` as
+a `RefreshedAuthToken` (73), and `signOut`. Its only implementation is
+`_FirebaseAuthTokenGateway` (`services/auth_service.dart:27`). Rename it
+`AuthSessionGateway` and add:
+
+| Member | Contract |
+| --- | --- |
+| `AuthUserSnapshot? get currentUser` | Synchronous, from the in-memory session. `uid` is the Cognito `sub` |
+| `Stream<AuthUserSnapshot?> userChanges()` | Emits on sign-in, sign-out and account switch. Replaces `authStateChanges()` |
+| `Stream<RefreshedAuthToken> tokenChanges()` | Emits after each refresh. Replaces `idTokenChanges()` |
+| `Future<RefreshedAuthToken?> forceRefresh()` | Refresh-token grant against `/oauth2/token` |
+| `Future<AuthSignInResult> signIn()` | Hosted UI authorization code with PKCE. `AuthSignInResult` holds the snapshot and an `isNewUser` flag, replacing `UserCredential` |
+| `Future<void> signOut()` | `/oauth2/revoke` on the refresh token, local wipe, then hosted-UI `/logout` |
+| `Future<void> updateDisplayName(String)` | Local profile field only. The pool is admin-managed |
+
+`CognitoAuthSessionGateway` implements it. It stores the access, ID and refresh
+tokens in `flutter_secure_storage` (already pinned at `app/pubspec.yaml:79`) and
+restores them before `runApp`. `isAnonymous` is always false. The anonymous
+migration and link paths (`auth_provider.dart` lines 30-48, `auth_service.dart`
+1166-1199) are deleted, because the pool has no anonymous users.
+
+**Direct consumers to move onto the gateway** (paths relative to `app/lib/`):
+
+| File | Lines | Use |
+| --- | --- | --- |
+| `main.dart` | 306 | Auth emulator setup. Deleted |
+| `main.dart` | 351, 370, 383 | Restore, bootstrap and identity checks on startup |
+| `main.dart` | 412, 418 | Email and uid for crash and analytics identity |
+| `main.dart` | 634 | Resume-time owner check |
+| `services/auth_service.dart` | 30, 42, 48, 176 | The current gateway implementation |
+| `services/auth_service.dart` | 247, 284 | Google and Apple sign-in. Deleted |
+| `services/auth_service.dart` | 648 `authenticateWithProvider`, 842 `_signInWithOAuthCredentials` | Becomes `signIn()` against `/oauth2/authorize` |
+| `services/auth_service.dart` | 791 `signInWithLocalDevToken` | Deleted with the backend local-dev token route |
+| `services/auth_service.dart` | 513-580 `refreshIdToken` | Becomes `forceRefresh()` |
+| `services/auth_service.dart` | 993, 1024 | Display-name update. Becomes `updateDisplayName` |
+| `providers/auth_provider.dart` | 50, 80, 99, 187, 190 | Signed-in and owner checks |
+| `providers/auth_provider.dart` | 116 `authStateChanges`, 141 and 144 `idTokenChanges` | Become `userChanges()` and `tokenChanges()` |
+| `providers/auth_provider.dart` | 236, 268, 311-343 | `UserCredential` sign-in flow. Becomes `AuthSignInResult` |
+| `services/onboarding_sync_runtime.dart` | 34 | Auth listener that wakes onboarding sync |
+| `services/on_device/on_device_background.dart` | 35, 49 | Owner check and auth listener for background work |
+| `services/siri_integration.dart` | 1051 | Owner check before opening a Siri result |
+| `services/telemetry/client_telemetry_transport.dart` | 18, 33 | Telemetry owner id and token |
+| `pages/chat/widgets/content_blocks/edit_receipt_block.dart` | 253, 258 | Owner check for receipt undo |
+| `pages/home/home_deep_links.dart` | 205, 208, 256, 260, 291, 293 | Owner checks on deep-link resolution |
+| `pages/home/item_list_sheet.dart` | 60, 66 | Owner check |
+| `pages/onboarding/wrapper.dart` | 627-629 | Email, name and uid for onboarding |
+| `pages/onboarding/variants/yinka/yinka_onboarding_flow.dart` | 156-158 | Same |
+| `pages/settings/change_name_widget.dart` | 20 | Firebase `User` field |
+| `utils/auth/sign_in_failure.dart` | 32 | `FirebaseAuthException` mapping. Maps OAuth error codes instead |
+
+**Removal list:** `startup_firebase.dart`, `firebase_options_local.dart`,
+`utils/debugging/crashlytics_manager.dart`; `firebase_core`, `firebase_auth`,
+`firebase_messaging`, `firebase_crashlytics`, `google_sign_in` and
+`sign_in_with_apple` at `pubspec.yaml:40-47`, plus `google_sign_in_ios` (161)
+and the Firebase test interfaces (178, 197); the Google services and
+Crashlytics Gradle plugins at `android/settings.gradle:23-24` and
+`android/app/build.gradle:4-5`; `google-services.json` and
+`GoogleService-Info.plist` with their Xcode project references. Push moves to a
+no-op `NotificationService`.
+
+**Acceptance check for the auth card:** `grep -r 'package:firebase_' app/lib`
+returns nothing, and sign-in, cold restore, sign-out and account switch work
+against the pool.
 
 ### STT: Amazon Transcribe streaming
 
@@ -238,14 +312,65 @@ Sources: [streaming](https://docs.aws.amazon.com/transcribe/latest/dg/streaming.
 [diarization](https://docs.aws.amazon.com/transcribe/latest/dg/diarization.html),
 [partial results](https://docs.aws.amazon.com/transcribe/latest/dg/streaming-partial-results.html).
 
-SDK: `aws-sdk-transcribe-streaming` (developer preview, so pin the version). The
-deprecated `amazon-transcribe` package was rejected for high CPU use. A raw
-WebSocket with event-stream framing is the fallback if the preview SDK breaks.
+**Transport: raw WebSocket on Python 3.11.** The backend images are pinned to
+Python 3.11 (`backend/Dockerfile:1`, `backend/pusher/Dockerfile:1`).
 
-Config: `STT_SERVICE_MODELS=transcribe`, `SONIOX_API_KEY` and `MODULATE_API_KEY`
-unset, `STT_GPU_FLEET_OFF` unset. `validate_streaming_stt_env`
-(`utils/stt/streaming.py:861`) raises when `soniox` is listed without a key, or
-when `STT_GPU_FLEET_OFF` is true without one.
+- **Chosen.** Call the `StartStreamTranscriptionWebSocket` endpoint directly.
+  Build the presigned `wss://transcribestreaming.ap-southeast-2.amazonaws.com:8443`
+  URL with botocore `SigV4QueryAuth`, connect with the already-pinned
+  `websockets==12.0` (`backend/requirements.txt:236`), decode responses with
+  botocore's `eventstream.EventStreamBuffer`, and encode audio frames with a
+  small in-tree event-stream encoder (prelude, headers, CRC32 from `zlib`).
+  `boto3` and `botocore` are not in `backend/requirements.txt` today. They are
+  added anyway for S3, Cognito and Bedrock.
+- **Rejected: `aws-sdk-transcribe-streaming`.** PyPI lists it as a developer
+  preview that requires Python 3.12 or later.
+- **Rejected: `amazon-transcribe`.** Deprecated, and it depends on `awscrt`.
+- **Rejected: upgrading the images to Python 3.12.** It re-resolves the whole
+  dependency lock for one provider.
+- `UNVERIFIED`: botocore's event-stream decoder is an internal module, not a
+  documented public API. Pin the botocore version and cover the decoder with a
+  framing test.
+
+### STT: seam contract
+
+The STT provider set is closed. `STT_SERVICE_MODELS=transcribe` is rejected
+today because `STTService` (`utils/stt/streaming.py:122`) has no member for it,
+`provider_for_model_token('transcribe')` (`config/stt_provider_policy.py:324`)
+returns `None`, `PROVIDER_SERVING_SURFACES` (106) omits it, and
+`get_stt_service_for_language` (`streaming.py:962`) has no branch for it. The
+STT card adds a branch or set entry at each seam below.
+
+| Seam | Change |
+| --- | --- |
+| `config/stt_provider_policy.py` provider constants (lines 25-29) | Add `TRANSCRIBE_PROVIDER = 'transcribe'` |
+| `PROVIDER_SERVING_SURFACES` (106) | `TRANSCRIBE_PROVIDER: {STREAMING}`. Prerecorded and PTT stay off until phase 2 |
+| `DEFAULT_MODELS_BY_SURFACE` (145) and `canonical_model_config` (385) | Streaming default `('transcribe',)`. `scripts/runtime_env_validation/manifest.py` checks the deployed `STT_SERVICE_MODELS` in `deploy/runtime_env/_base.yaml` against this, so the fork's runtime env file changes in the same card |
+| `provider_for_model_token` (324), `provider_for_service` (390) | Map the `transcribe` token and service to the provider |
+| Language policy in `stt_provider_policy.py` | A `TRANSCRIBE_SUPPORTED_LANGUAGES` set beside `MODULATE_SUPPORTED_LANGUAGES`, from the Transcribe streaming language table |
+| `config/policy/listen.py` | `service_models` default |
+| `utils/stt/streaming.py` `STTService` (122) | Add `transcribe`, with its model name and circuit-breaker key |
+| `_primary_streaming_service` (313), `get_stt_service_for_language` (962), `connect_stt_socket_with_fallback` (457) | Selection and connect branches. With one provider there is no fallback hop |
+| `validate_streaming_stt_env` (861) | New check: fail startup when `transcribe` is listed and no AWS region is configured |
+| New `utils/stt/transcribe.py` | `TranscribeStreamingSocket(STTSocket)` and `process_audio_transcribe`, emitting the existing connect-latency and stream-close metrics |
+| `utils/stt/live_session.py`, `utils/stt/live_chain.py`, `config/live_stt_registry.py` | Session build branch, callbacks, demand lane, and the `DEFAULT_TARGETS` and `Target.capable` entries |
+| `routers/listen/receiver.py` legacy provider branch | Add the branch, or route `transcribe` through the managed chain only |
+| Closed provider sets in the resilience, allowance-watch, connect-backoff, stream-close, live-health, live-metrics, provider-stream-end and vendor-guard modules | Add the provider, or the provider is treated as unknown |
+| Task IAM role | `transcribe:StartStreamTranscriptionWebSocket` |
+| Tests | `tests/unit/test_stt_provider_policy.py` canonical-config cases, plus new framing and speaker-mapping tests for `transcribe.py` |
+
+The repo-wide sweep for the closed sets is `grep -rn SONIOX_PROVIDER backend/`
+and `grep -rn "STTService.soniox" backend/`. Every hit is a place the new
+provider must appear or be deliberately absent.
+
+**Runtime config:** `STT_SERVICE_MODELS=transcribe`, `SONIOX_API_KEY` and
+`MODULATE_API_KEY` unset, `STT_GPU_FLEET_OFF` unset. `validate_streaming_stt_env`
+also raises when `soniox` is listed without a key, or when `STT_GPU_FLEET_OFF`
+is true without one.
+
+**Accepted limitation.** A single streaming provider with no failover hop. A
+Transcribe outage ends live capture until it recovers. Video attachments in chat
+get an empty transcript, because prerecorded Transcribe is phase 2.
 
 ### LLM: Bedrock through `langchain-aws`
 
@@ -266,6 +391,21 @@ when `STT_GPU_FLEET_OFF` is true without one.
   (`agentic.py` around line 963) switches to `anthropic.AsyncAnthropicBedrock`.
 - **Gateway.** `OMI_LLM_GATEWAY_FEATURE_MODE` stays unset, so features call the
   model directly.
+
+### Chat files: S3 plus Bedrock content blocks
+
+`POST /v2/files` and `/v2/files/video` upload attachments to OpenAI Files today
+(`utils/other/chat_file.py:249` and 343), and the answer path calls OpenAI chat
+completions directly (`_ask_files_stream` at 397, `_ask_files` at 462).
+
+- Store the bytes in `BUCKET_CHAT_FILES` under `{uid}/{file_id}`. Keep the
+  `openai_file_id` field on `u/files/{id}` and put the S3 key in it, so the
+  rows and `download_owned_chat_file` (115) keep their shape.
+- At answer time, read the object and send it to `ChatBedrockConverse` as an
+  image or document content block, replacing both `_ask_files*` paths.
+- Cleanup deletes the S3 object instead of the OpenAI file.
+- The thumbnail bucket write (`utils/other/storage.py:2343`) is unchanged apart
+  from the storage client.
 
 ### Hosting
 
@@ -353,29 +493,63 @@ become presigned URLs, and resumable uploads become multipart uploads.
   allowance. The chat quota does not honour reviewers, so seed the owner's
   `users/{sub}` document with `subscription.plan=unlimited`,
   `subscription.status=active` and a far-future `current_period_end`.
-- `OMI_ROLE` unset, so `app_roles.py` mounts every router role.
+- `OMI_ROLE` unset, so `app_roles.py` mounts every router role, then prunes the
+  cut routers and routes named by `OMI_DISABLED_ROUTERS` and
+  `OMI_DISABLED_ROUTES` (see "Cut switches").
 - `DIRECTORY_ROUTING_MODE` unset (off), `FAIR_USE_ENABLED=false`,
   `STT_CAP_DISPATCH_ENFORCEMENT=false`.
 
-### MVP cut list
+### Cut switches
 
-| Feature | Switch that disables it | Effect |
+Every cut feature is disabled by a named switch. A feature is either
+**disabled**, meaning its routes are not mounted and return 404, or
+**unconfigured**, meaning it stays mounted but has no credentials, so its
+callers get an empty result or a 5xx. The MVP uses disabled for every cut route
+the app can reach, and unconfigured only for internal calls with no route.
+
+**Two new switches**, owned by `backend/app_roles.py` and read where
+`main.py:148-149` resolves the role and mounts routers:
+
+| Switch | Value | Enforcement |
 | --- | --- | --- |
-| Stripe billing | `STRIPE_API_KEY`, `STRIPE_*_PRICE_ID` unset. `validate_stripe_price_ids` skips under `dev` and skips empty price ids | Paid plans invisible. Owner is seeded `unlimited` |
-| PostHog | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_API_KEY`, `POSTHOG_HOST` unset on the backend. App guards on `Env.posthogApiKey != null` | No analytics |
-| LangSmith | `LANGSMITH_TRACING=false`, no `LANGSMITH_API_KEY` | No LLM tracing |
-| Plugins / app store | No switch exists. Routers stay mounted, and the MVP client loop never calls `/v1/apps*` or `/v2/apps*`. Seam to add: a router denylist in `app_roles.py::mount_routers` (329) | Store pages return empty or error |
-| Typesense | `TYPESENSE_HOST`, `TYPESENSE_API_KEY` unset | `POST /v1/conversations/search` returns 500 because `search_conversations` raises. The app search box is unsupported in MVP |
-| Pinecone | `PINECONE_API_KEY`, `PINECONE_INDEX_NAME` unset | Index is `None`. Upserts return `False`, queries return empty, and chat retrieval (`utils/retrieval/tool_services/conversations.py:330`) skips the vector branch |
-| Twilio phone calls | `TWILIO_*` unset | `twilio_service` raises, so phone-call routes fail. Unused by the MVP loop |
-| Telegram / iMessage messaging | `OMI_TELEGRAM_ENABLED=off`, `OMI_IMESSAGE_ENABLED=off` (defaults) | `start_adapters` returns `None` |
-| Third-party integrations (Google Calendar, Gmail, Tasks) | `GOOGLE_TASKS_CLIENT_ID` and the other provider client ids unset | Integration tools report unconfigured |
-| Push notifications | Client never registers an FCM token, so `_send_to_user` returns 0. Seam to add: `OMI_PUSH_PROVIDER` in `utils/notifications.py` | No push |
-| Firebase sign-in (`/v1/auth/*`) | Client uses the Cognito hosted UI instead | Google and Apple buttons removed from the fork |
-| Client Firebase SDKs (Messaging, Crashlytics) and Intercom | Removed from the fork's Flutter build | No crash reports or support chat |
-| Offline sync upload (`/v2/sync-local-files`, `/v2/sync-capture-manifest`) | Deferred to phase 2. The WAL keeps audio locally on 503 (`app/lib/services/wals/CUSTODY.md`) | Phase 2 path is Transcribe batch from S3 |
-| Custom vocabulary, owner voiceprint | `HOSTED_SPEAKER_EMBEDDING_API_URL` unset | Lower diarization quality |
-| Perplexity web search tool | `PERPLEXITY_API_KEY` unset | Chat web-search tool unavailable |
+| `OMI_DISABLED_ROUTERS` | Comma-separated `Mount.module` names from `ROUTER_MOUNTS`, for example `apps,payment` | `mounts_for` (`app_roles.py:321`) drops matching mounts before `mount_routers` (329) includes them |
+| `OMI_DISABLED_ROUTES` | Semicolon-separated `METHOD /path` entries, matching the decorator path exactly, for example `POST /v1/conversations/search` | After `mount_routers`, remove each matching `APIRoute` (or `APIWebSocketRoute` for `WS /path`) from `app.router.routes` |
+
+Both default to empty, so an unset deployment mounts exactly what it mounts
+today and `tests/unit/test_app_roles_route_census.py` stays green. An entry that
+matches no mount or route raises `RoleConfigError` at startup, the same way
+`role_from_env` (308) rejects an unknown `OMI_ROLE`, so a typo cannot leave a
+feature silently mounted. A disabled route returns 404, or 405 when another
+method is still mounted on the same path.
+
+**Cut list:**
+
+| Feature | Switch | Disabled behaviour | Client result |
+| --- | --- | --- | --- |
+| Firebase sign-in (`/v1/auth/*`) | `OMI_DISABLED_ROUTERS=auth` | 404 on `/v1/auth/authorize`, `/callback/*`, `/token`, `/local-dev/custom-token` | Never called. The app uses the Cognito hosted UI. `oauth` stays mounted for MCP |
+| Stripe billing | `OMI_DISABLED_ROUTERS=payment,retention_offer,yearly_switch,redeem_code,storefront`, plus `STRIPE_API_KEY` and `STRIPE_*_PRICE_ID` unset | 404 on `/v1/payments/*`, `/v1/stripe/*`, `/v1/payment-methods/*` | `GET /v1/users/me/subscription` stays mounted and returns the seeded `unlimited` plan without calling Stripe. `showSubscriptionUI` is false, so the paywall never opens |
+| Plugins / app store | `OMI_DISABLED_ROUTERS=apps,developer,developer_key` | 404 on `/v1/apps*`, `/v2/apps*` | Conversation detail keeps its cached summary templates (`SummaryTemplatesLoad.failed`) |
+| Typesense search | `OMI_DISABLED_ROUTES=POST /v1/conversations/search`, plus `TYPESENSE_HOST` and `TYPESENSE_API_KEY` unset | 404 | Search returns `ConversationSearchResult.failure` (`app/lib/backend/http/api/conversations.dart:1312`). With the env vars unset, `utils/conversations/typesense_index.py` skips index writes |
+| Pinecone | `PINECONE_API_KEY`, `PINECONE_INDEX_NAME` unset (unconfigured, no route) | Index is `None`. Upserts return `False`, queries return empty | Chat retrieval skips the vector branch (`utils/retrieval/tool_services/conversations.py:330`) |
+| Twilio phone calls | `OMI_DISABLED_ROUTERS=phone_calls`, plus `TWILIO_*` unset | 404 on `/v1/phone/*` | `/v4/listen?source=phone_call` cannot start, because the client needs `POST /v1/phone/token` first |
+| Telegram / iMessage messaging | `OMI_DISABLED_ROUTERS=messaging`, plus `OMI_TELEGRAM_ENABLED=off` and `OMI_IMESSAGE_ENABLED=off` (the defaults, `utils/messaging/adapters/runtime.py:23,35`) | 404 on `/v1/messaging/*`. `start_adapters` returns `None` | Channel chats page unreachable |
+| Google Calendar and X | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,x_connector` | 404 on `/v1/calendar/*`, `/v1/x/*` | Calendar auto-link returns null on non-200 |
+| Task and app integrations (Google Tasks, Todoist, Asana, ClickUp, Gmail) | `OMI_DISABLED_ROUTES=GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url`, plus provider client ids unset | 404 on the OAuth starts. The status reads stay mounted and return no connections | Startup loads succeed with an empty map. Connect buttons fail. Chat integration tools report unconfigured |
+| Push notifications | `OMI_DISABLED_ROUTES=POST /v1/users/fcm-token`. `firebase_messaging` is removed from the app and `NotificationService` becomes a no-op | 404. With no stored tokens, `utils/notifications.py:246` `_send_to_user` sends nothing. `PUT /v1/users/time-zone` on the same router stays mounted | No push |
+| Offline and SD-card sync upload | `OMI_DISABLED_ROUTES=POST /v2/sync-capture-manifest;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id}` | 404 | The WAL treats only 400 and 413 as definitive refusals (`app/lib/services/wals/wal_policy.dart:113`), so a 404 keeps audio on the device. Phase 2 path is Transcribe batch from S3 |
+| Voice messages | `OMI_DISABLED_ROUTES=POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream` | 404, and the WebSocket upgrade is refused | `voice_recorder_provider.dart` catches the failure |
+| TTS | `OMI_DISABLED_ROUTERS=tts` | 404 on `/v2/tts/*` | Playback falls back to the system voice |
+| Speech-profile enrolment | `OMI_DISABLED_ROUTES=GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability` | 404 | `GET /v3/speech-profile` stays mounted and returns `false` |
+| Owner voiceprint | `HOSTED_SPEAKER_EMBEDDING_API_URL` unset (unconfigured, no route) | `utils/stt/speaker_embedding.py:59` returns no embedding | Lower diarization quality |
+| Perplexity web search tool | New `OMI_WEB_SEARCH_TOOL=off`, read where `utils/retrieval/agentic.py:1694` registers the tool. `PERPLEXITY_API_KEY` unset | The tool is not registered, so the model never sees it | Chat answers without web search. Today the tool stays registered and returns an error string |
+| PostHog | `POSTHOG_PRODUCT_CAPTURE_TOKEN`, `POSTHOG_PROJECT_API_KEY`, `POSTHOG_API_KEY` and `POSTHOG_HOST` unset on the backend (`utils/product_telemetry.py:53-81`). The app guards on `Env.posthogApiKey != null` | No events sent | None |
+| LangSmith | `LANGSMITH_TRACING=false`, no `LANGSMITH_API_KEY` (`utils/observability/langsmith.py:26`) | No tracing | None |
+| Crashlytics and Intercom (client) | Removed from the fork's Flutter build. Intercom is also off when `Env.intercomAppId` is unset | n/a | No crash reports or support chat |
+| Custom vocabulary | Not sent to Transcribe | n/a | Per-user keywords ignored |
+
+The exact route spellings above are checked at startup, so the cut card can
+copy them into the fork's runtime env file and get a startup failure if any
+path has drifted.
 
 ## Consequences
 
