@@ -70,6 +70,7 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | Gemini / ElevenLabs TTS (`/v2/tts/synthesize`) | Cut for MVP. Amazon Polly later | Polly now (the client already falls back to the system voice) | `routers/tts.py` | No |
 | Pinecone (conversation vectors) | Cut for MVP. pgvector on the same Aurora cluster later | OpenSearch Serverless (OCU minimum is a standing cost for one user) | `database/vector_db.py` (`PINECONE_API_KEY`/`PINECONE_INDEX_NAME` at 144-155) | No |
 | Typesense (conversation search) | Cut for MVP. Postgres full-text search later | OpenSearch managed domain (standing instance cost) | `utils/conversations/search.py::search_conversations` (342) | No |
+| Google Maps Static API (`GET /v1/static-map`, `utils/static_map.py:343`, `GOOGLE_MAPS_API_KEY`) | Cut for MVP via `OMI_DISABLED_ROUTERS=static_map`. Amazon Location Service static maps later | Keeping the Google key (a GCP credential in an AWS-only port) | `routers/static_map.py`, `utils/static_map.py::fetch_static_map` | No |
 | Firebase Cloud Messaging push | Cut for MVP via `OMI_DISABLED_ROUTES` (see "Cut switches"). SNS mobile push to APNs later | Amazon Pinpoint (end of support 2026-10-30) | `POST /v1/users/fcm-token` (`routers/notifications.py:35`), `utils/notifications.py` | No |
 | GitHub Releases (firmware manifest) | Kept as is. Not GCP | S3 mirror of firmware binaries (duplicates a public source that already has a Redis LKG cache) | `utils/github_releases.py` | n/a |
 | Secret Manager / env files | AWS Secrets Manager, injected as ECS task secrets | SSM Parameter Store SecureString (no managed rotation for the RDS secret) | ECS task definition `secrets` | n/a |
@@ -122,6 +123,19 @@ Table layout: one `documents` table keyed by full document path, with
 `update_time` columns. Composite indexes become expression indexes on the
 `data` paths that `firestore.indexes.json` lists. `AsyncClient` gets the same
 transport through its async GAPIC stub.
+
+**Error types.** The adapter raises `google.api_core.exceptions` types
+(`NotFound`, `AlreadyExists`, `FailedPrecondition`, `Aborted`,
+`DeadlineExceeded`, `ServiceUnavailable`), never `psycopg` errors. Nine modules
+catch `GoogleAPICallError` and map it to a retry or a 503:
+`database/action_items.py`, `database/batch_pipeline_reads.py`,
+`database/batch_privacy_write_fence.py`, `database/chat_first_delivery_attempts.py`,
+`routers/conversation_tasks.py` (the MVP task-presence route),
+`utils/batch_pipeline/merge.py`, `utils/conversations/processing_retry.py`,
+`utils/sync/failure_reason.py` and `utils/sync/pipeline.py`. A Postgres error
+that escaped as its own type would turn those retries into 500s. The adapter
+maps serialization failures to `Aborted` and statement timeouts to
+`DeadlineExceeded`.
 
 Rejected adapter alternatives:
 
@@ -321,8 +335,8 @@ Python 3.11 (`backend/Dockerfile:1`, `backend/pusher/Dockerfile:1`).
   `websockets==12.0` (`backend/requirements.txt:236`), decode responses with
   botocore's `eventstream.EventStreamBuffer`, and encode audio frames with a
   small in-tree event-stream encoder (prelude, headers, CRC32 from `zlib`).
-  `boto3` and `botocore` are not in `backend/requirements.txt` today. They are
-  added anyway for S3, Cognito and Bedrock.
+  `boto3` and `botocore` are in neither image's lock today. They are added to
+  both, as described under "Python dependency closure".
 - **Rejected: `aws-sdk-transcribe-streaming`.** PyPI lists it as a developer
   preview that requires Python 3.12 or later.
 - **Rejected: `amazon-transcribe`.** Deprecated, and it depends on `awscrt`.
@@ -356,6 +370,7 @@ STT card adds a branch or set entry at each seam below.
 | `utils/stt/live_session.py`, `utils/stt/live_chain.py`, `config/live_stt_registry.py` | Session build branch, callbacks, demand lane, and the `DEFAULT_TARGETS` and `Target.capable` entries |
 | `routers/listen/receiver.py` legacy provider branch | Add the branch, or route `transcribe` through the managed chain only |
 | Closed provider sets in the resilience, allowance-watch, connect-backoff, stream-close, live-health, live-metrics, provider-stream-end and vendor-guard modules | Add the provider, or the provider is treated as unknown |
+| Pusher image dependencies | `pusher/main.py:30` imports `validate_streaming_stt_env` from the shared `utils/stt/streaming.py` and calls it at startup (55). Once that module imports `utils/stt/transcribe.py`, the pusher image needs `botocore` too. Add it to `backend/pusher/requirements.txt` and regenerate `backend/pusher/pylock.toml`. See "Python dependency closure" |
 | Task IAM role | `transcribe:StartStreamTranscriptionWebSocket` |
 | Tests | `tests/unit/test_stt_provider_policy.py` canonical-config cases, plus new framing and speaker-mapping tests for `transcribe.py` |
 
@@ -372,13 +387,56 @@ is true without one.
 Transcribe outage ends live capture until it recovers. Video attachments in chat
 get an empty transcript, because prerecorded Transcribe is phase 2.
 
+### Python dependency closure
+
+The backend and pusher images install from separate locks. `backend/Dockerfile:22`
+syncs `backend/pylock.runtime.toml`, which is compiled from
+`backend/requirements.txt`. `backend/pusher/Dockerfile:20-21` syncs only
+`backend/pusher/pylock.toml`, which is compiled from the smaller
+`backend/pusher/requirements.txt`. The pusher image copies the shared
+`config/`, `database/`, `routers/`, `services/` and `utils/` trees
+(`pusher/Dockerfile:44-52`). Any third-party package that shared code
+imports must therefore be in both requirement files. A package added only to
+`backend/requirements.txt` fails at import time in pusher.
+
+New packages and the image that reaches each one:
+
+| Package | Reached from | `requirements.txt` | `pusher/requirements.txt` |
+| --- | --- | --- | --- |
+| `boto3`, `botocore` | S3 storage client, Cognito `AdminGetUser`, Transcribe socket and presigning, Secrets Manager reads | add | add. Pusher reaches the storage client during finalization, and `validate_streaming_stt_env` at startup |
+| `langchain-aws` | `utils/llm/providers.py` `bedrock` provider and `BedrockEmbeddings` | add | add. Pusher runs `process_conversation`, which calls `get_llm` for the conversation and memory features |
+| `anthropic[bedrock]` extra | `AsyncAnthropicBedrock` in `utils/retrieval/agentic.py` | change `anthropic>=0.52.0` to `anthropic[bedrock]>=0.52.0` | same change. The bare `anthropic` pin is already in both files |
+| `PyJWT` | `verify_token` in `utils/other/endpoints.py` | already pinned (`requirements.txt:173`) | not added. Pusher does not import `endpoints.py`. The closure probe below confirms it |
+
+Every package uses the same pin in both files. `psycopg[binary]==3.2.10`,
+`redis==5.0.8` and `websockets==12.0` are already in both. After editing both
+requirement files, run `backend/scripts/update-python-lock.sh`. It regenerates
+`pylock.toml`, `pylock.runtime.toml`, the macOS and Windows locks, and
+`pusher/pylock.toml` (line 46) in one pass.
+
+**Verification in each implementation card that adds an import:**
+
+1. Build both images, `backend/Dockerfile` and `backend/pusher/Dockerfile`.
+2. Run `python3 backend/scripts/runtime_image_contracts.py smoke --dockerfile backend/pusher/Dockerfile --image <pusher image>`,
+   and the same with `backend/Dockerfile` and the backend image. `smoke_image`
+   (`runtime_image_contracts.py:812`) imports every third-party module the
+   image's first-party closure reaches, then imports the entrypoint. It fails
+   when a lock is missing a package.
+3. Extend `tests/unit/test_runtime_image_contracts.py` the way
+   `test_pusher_dependency_probe_includes_jsonschema` (361) does: assert that
+   `botocore` and `langchain_aws` are in the pusher contract's
+   `third_party_dependency_modules`.
+
 ### LLM: Bedrock through `langchain-aws`
 
 - **Provider.** Add a `bedrock` provider beside `OPENAI_COMPATIBLE_PROVIDERS`
   (`utils/llm/providers.py:71`) that returns `ChatBedrockConverse`. Today every
   managed feature resolves to `('gpt-6-luna', 'openai')` in
   `utils/llm/model_config.py`. Add an `aws` profile to `MODEL_QOS_PROFILES` and
-  set `MODEL_QOS=aws`.
+  set `MODEL_QOS=aws`. The profile covers every feature key in
+  `model_config.py`, including `episode_composer` (line 113), which the
+  episodes read path reaches through `utils/episodes/home_read.py:389`
+  `schedule_missed_composes`.
 - **Models** (verified in ap-southeast-2 with `list-inference-profiles`):
   `au.anthropic.claude-sonnet-4-5-20250929-v1:0` for `chat_agent` and
   `conv_structure`, and `au.anthropic.claude-haiku-4-5-20251001-v1:0` for the
@@ -415,7 +473,7 @@ completions directly (`_ask_files_stream` at 397, `_ask_files` at 462).
 | Subnets | `omi-public-a/b` (tasks, ALB), `omi-isolated-a/b` (Aurora, Valkey). No NAT gateway |
 | VPC endpoint | S3 gateway endpoint on the public route tables |
 | ECS cluster | `omi-cluster` (Fargate, x86_64). Existing clusters `pihole-cluster` and `KeycloakStack` are untouched |
-| ECS service / task | `omi-backend`. One task with containers `backend` (port 8080) and `pusher` (port 8081). Starting size 2 vCPU and 4-6 GiB (`UNVERIFIED`; measure the image's resident size first) |
+| ECS service / task | `omi-backend`. One task with containers `backend` (port 8080) and `pusher` (port 8081). Starting size 2 vCPU and 4-6 GiB (`UNVERIFIED`; measure the image's resident size first). Both images bind 8080 by default, so the `pusher` container definition overrides `command`, as described under "Pusher sidecar" |
 | ECR | `omi/backend`, `omi/pusher` |
 | ALB | `omi-alb`, internet-facing, HTTPS 443 only, idle timeout 3600 s (the client pings every 20 s; long chat streams need headroom) |
 | Target group | `omi-backend-tg`, HTTP 8080, health check `GET /health` (`routers/desktop_core.py:77`) |
@@ -437,10 +495,28 @@ cannot hold the `/v4/listen` WebSocket.
 (`routers/listen/conversations.py:330`) logs "Pusher unavailable; finalization
 remains queued" and returns `False` when no pusher client exists and
 listen-finalization dispatch is off. Conversations would never finalize. The
-pusher image (`backend/pusher/Dockerfile`) therefore runs in the same task on
-port 8081, with `HOSTED_PUSHER_API_URL=http://localhost:8081`. It stays off the
-ALB, because `/v1/trigger/listen` takes a `uid` query parameter without
+pusher image (`backend/pusher/Dockerfile`) therefore runs in the same task,
+with `HOSTED_PUSHER_API_URL=http://localhost:8081`. It stays off the ALB,
+because `/v1/trigger/listen` takes a `uid` query parameter without
 authenticating it.
+
+Fargate tasks use `awsvpc` networking, so both containers share one network
+namespace and one port space. Both images hard-code `--port 8080` in `CMD`
+(`backend/Dockerfile:63`, `backend/pusher/Dockerfile:58`), so pusher cannot
+keep its image default. The `pusher` container definition overrides `command`
+with the image's arguments, changing only the port:
+
+```json
+["uvicorn", "pusher.main:app", "--host", "0.0.0.0", "--port", "8081",
+ "--ws-ping-interval", "20", "--ws-ping-timeout", "20", "--loop", "uvloop",
+ "--timeout-graceful-shutdown", "90"]
+```
+
+Its `portMappings` entry is `containerPort: 8081`, and its container health
+check is `curl -fsS http://localhost:8081/health`. The image is unchanged, so
+upstream's deployment keeps port 8080. The hosting card adds a synth-time
+assertion that the `pusher` command contains `--port 8081` and that
+`HOSTED_PUSHER_API_URL` names the same port.
 
 **S3 buckets** (names are `omi-<purpose>-717494614307-apse2`; versioning off,
 SSE-S3, public access blocked):
@@ -455,9 +531,13 @@ SSE-S3, public access blocked):
 | `BUCKET_POSTPROCESSING` | `omi-postprocessing-717494614307-apse2` | reprocess inputs |
 
 Other `BUCKET_*` variables (`BUCKET_BATCH_PIPELINE`, `BUCKET_SCREEN_FRAMES`,
+`BUCKET_FRAME_REQUESTS`, `BUCKET_FRAME_REQUESTS_TEMPORARY`,
 `BUCKET_TEMPORAL_SYNC_LOCAL`, `BUCKET_MEMORIES_RECORDINGS`,
 `BUCKET_DESKTOP_UPDATES`, `BUCKET_PLUGINS_LOGOS`, `BUCKET_APP_THUMBNAILS`) stay
-unset for MVP.
+unset for MVP. Leaving a bucket unset does not remove its routes. Every route
+that reads one of these buckets is also removed by a cut switch: `screen_frames`
+for screenshots, `frame_requests` for photo images, and `apps` for thumbnails
+and logos.
 
 GCS semantics in the S3 client: `if_generation_match=0` becomes
 `If-None-Match: *`. Other generation preconditions become `If-Match` on the
@@ -498,6 +578,13 @@ become presigned URLs, and resumable uploads become multipart uploads.
   `OMI_DISABLED_ROUTES` (see "Cut switches").
 - `DIRECTORY_ROUTING_MODE` unset (off), `FAIR_USE_ENABLED=false`,
   `STT_CAP_DISPATCH_ENFORCEMENT=false`.
+- `EPISODES_CLIENT_CHANNELS=beta,store`. The default `beta` admits only
+  non-production builds (`config/episodes.py:18-25`). Setting both channels
+  gives the fork's debug and release builds the same Home episode UI.
+  `EPISODES_ENABLED` stays unset (on).
+- `REVIEW_SURFACE_MODE` and `DREAM_AGENT_ENABLED` stay at their defaults (off).
+  Their routers are also removed by `OMI_DISABLED_ROUTERS`, so the 404 the
+  client reads as "Review off" does not depend on the flag.
 
 ### Cut switches
 
@@ -506,6 +593,9 @@ Every cut feature is disabled by a named switch. A feature is either
 **unconfigured**, meaning it stays mounted but has no credentials, so its
 callers get an empty result or a 5xx. The MVP uses disabled for every cut route
 the app can reach, and unconfigured only for internal calls with no route.
+A router switch removes a whole module. A cut route that lives in a retained
+module (for example the calendar-event routes in `conversations`) gets its own
+route switch entry.
 
 **Two new switches**, owned by `backend/app_roles.py` and read where
 `main.py:148-149` resolves the role and mounts routers:
@@ -533,13 +623,17 @@ method is still mounted on the same path.
 | Pinecone | `PINECONE_API_KEY`, `PINECONE_INDEX_NAME` unset (unconfigured, no route) | Index is `None`. Upserts return `False`, queries return empty | Chat retrieval skips the vector branch (`utils/retrieval/tool_services/conversations.py:330`) |
 | Twilio phone calls | `OMI_DISABLED_ROUTERS=phone_calls`, plus `TWILIO_*` unset | 404 on `/v1/phone/*` | `/v4/listen?source=phone_call` cannot start, because the client needs `POST /v1/phone/token` first |
 | Telegram / iMessage messaging | `OMI_DISABLED_ROUTERS=messaging`, plus `OMI_TELEGRAM_ENABLED=off` and `OMI_IMESSAGE_ENABLED=off` (the defaults, `utils/messaging/adapters/runtime.py:23,35`) | 404 on `/v1/messaging/*`. `start_adapters` returns `None` | Channel chats page unreachable |
-| Google Calendar and X | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,x_connector` | 404 on `/v1/calendar/*`, `/v1/x/*` | Calendar auto-link returns null on non-200 |
+| Google Calendar and X | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,calendar_meetings,x_connector`, plus `OMI_DISABLED_ROUTES=POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link` | 404 on `/v1/calendar/*` (including `/v1/calendar/meetings*`, a separate module), `/v1/x/*`, and the three conversation calendar-event routes, which live in the retained `conversations` module | Auto-link returns null on any failure. "Link event" asks to connect Google Calendar, which never connects |
 | Task and app integrations (Google Tasks, Todoist, Asana, ClickUp, Gmail) | `OMI_DISABLED_ROUTES=GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url`, plus provider client ids unset | 404 on the OAuth starts. The status reads stay mounted and return no connections | Startup loads succeed with an empty map. Connect buttons fail. Chat integration tools report unconfigured |
 | Push notifications | `OMI_DISABLED_ROUTES=POST /v1/users/fcm-token`. `firebase_messaging` is removed from the app and `NotificationService` becomes a no-op | 404. With no stored tokens, `utils/notifications.py:246` `_send_to_user` sends nothing. `PUT /v1/users/time-zone` on the same router stays mounted | No push |
 | Offline and SD-card sync upload | `OMI_DISABLED_ROUTES=POST /v2/sync-capture-manifest;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id}` | 404 | The WAL treats only 400 and 413 as definitive refusals (`app/lib/services/wals/wal_policy.dart:113`), so a 404 keeps audio on the device. Phase 2 path is Transcribe batch from S3 |
 | Voice messages | `OMI_DISABLED_ROUTES=POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream` | 404, and the WebSocket upgrade is refused | `voice_recorder_provider.dart` catches the failure |
 | TTS | `OMI_DISABLED_ROUTERS=tts` | 404 on `/v2/tts/*` | Playback falls back to the system voice |
-| Speech-profile enrolment | `OMI_DISABLED_ROUTES=GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability` | 404 | `GET /v3/speech-profile` stays mounted and returns `false` |
+| Speech-profile enrolment | `OMI_DISABLED_ROUTES=GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability` | 404 | `GET /v3/speech-profile` stays mounted and returns `false`. The voice-profile flow's preflight reads the 404 as unavailable and shows `transcription_unavailable` |
+| Review and dream | `OMI_DISABLED_ROUTERS=review,dream_cohort,dream_report` | 404 on `/v1/review/*`, `/v2/review/*`, `/v1/entities*`, `GET /v1/conversations/{conversation_id}/entities`, `PUT /v1/users/release-channel`, `/v1/dream/runs` | `ReviewProvider` reads 404 or 403 as `ReviewAvailability.off` (`app/lib/providers/review_provider.dart:172-176`). The Activity page treats a 404 from `/v1/review/changes` as no changes (`activity_page.dart:192-193`) |
+| Google Maps static map | `OMI_DISABLED_ROUTERS=static_map`, plus `GOOGLE_MAPS_API_KEY` unset | 404 on `GET /v1/static-map` | `OmiMapPreview` falls back to its pin-dot canvas (`app/lib/widgets/omi_map_preview.dart:167-175`) |
+| Frame and photo evidence | `OMI_DISABLED_ROUTERS=frame_requests`, plus `BUCKET_FRAME_REQUESTS*` unset | 404 on `/v1/frame-requests*` and `GET /v1/conversations/{conversation_id}/photos/{photo_id}/image` | The necklace has no camera. The photo cache returns null and shows a placeholder |
+| Screenshots | `OMI_DISABLED_ROUTERS=screen_frames`, plus `BUCKET_SCREEN_FRAMES` unset | 404 on `/v1/conversations/{conversation_id}/screenshots*`, `/v1/conversations/{conversation_id}/shared/screenshots`, `/v1/screen-frame-egress/*` | The detail screenshot section hides on `ApiFailure` (`conversation_screenshots_section.dart:132-135`) |
 | Owner voiceprint | `HOSTED_SPEAKER_EMBEDDING_API_URL` unset (unconfigured, no route) | `utils/stt/speaker_embedding.py:59` returns no embedding | Lower diarization quality |
 | Perplexity web search tool | New `OMI_WEB_SEARCH_TOOL=off`, read where `utils/retrieval/agentic.py:1694` registers the tool. `PERPLEXITY_API_KEY` unset | The tool is not registered, so the model never sees it | Chat answers without web search. Today the tool stays registered and returns an error string |
 | PostHog | `POSTHOG_PRODUCT_CAPTURE_TOKEN`, `POSTHOG_PROJECT_API_KEY`, `POSTHOG_API_KEY` and `POSTHOG_HOST` unset on the backend (`utils/product_telemetry.py:53-81`). The app guards on `Env.posthogApiKey != null` | No events sent | None |
@@ -550,6 +644,46 @@ method is still mounted on the same path.
 The exact route spellings above are checked at startup, so the cut card can
 copy them into the fork's runtime env file and get a startup failure if any
 path has drifted.
+
+**Full switch values for the fork:**
+
+```text
+OMI_DISABLED_ROUTERS=auth,payment,retention_offer,yearly_switch,redeem_code,storefront,apps,developer,developer_key,phone_calls,messaging,tts,google_calendar,calendar_onboarding,calendar_meetings,x_connector,review,dream_cohort,dream_report,static_map,frame_requests,screen_frames
+OMI_DISABLED_ROUTES=POST /v1/users/fcm-token;POST /v1/conversations/search;POST /v2/sync-capture-manifest;POST /v1/sync-local-files;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id};POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream;GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability;GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url;POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link
+```
+
+Every module name is a `Mount(...)` in `ROUTER_MOUNTS`, and every route entry
+matches its decorator exactly. A router switch removes every mount of that
+module, so `developer` also removes nothing else that the MVP needs. The
+v1 `POST /v1/sync-local-files` (`routers/sync.py:605`) is listed beside the v2
+upload because both reach the cut batch STT path.
+
+**Duplicate decorator.** `DELETE /v1/conversations/{conversation_id}/action-items`
+is decorated at `routers/conversations.py:1820` and at `routers/action_items.py:1013`.
+`conversations` mounts first (`app_roles.py:196`, before 202), so its handler
+serves the route. The route switch matches by method and path, so a future
+entry for this path would remove both. No cut needs it.
+
+**Verification.** The cut-switch card adds a unit test beside
+`tests/unit/test_app_roles_route_census.py`. It builds the app with the two
+values above and asserts:
+
+1. Every route in the MVP census's
+   [cut table](MVP-API-SURFACE.md#cut-routes-and-their-switches) is absent from
+   `app.router.routes`.
+2. Every route the census marks **in** is still present.
+3. No route whose path starts with a cut prefix (`/v1/auth/`, `/v1/payments/`,
+   `/v1/stripe/`, `/v1/apps`, `/v2/apps`, `/v1/phone/`, `/v1/messaging/`,
+   `/v2/tts/`, `/v1/calendar/`, `/v1/x/`, `/v1/review/`, `/v2/review/`,
+   `/v1/entities`, `/v1/dream/`, `/v1/frame-requests`, `/v1/static-map`)
+   survives, except the two that are deliberately kept elsewhere:
+   `POST /v1/tts/synthesize` (`routers/desktop_tts_updates.py:190`, desktop
+   only, never called by the app) and the retired
+   `GET /v1/frame-requests/temporary/{request_id}/image`
+   (`routers/retired_app_client_contracts.py:107`, which answers 410).
+
+The census lists are a data file the test reads, so a route marked cut in the
+document cannot stay mounted unnoticed.
 
 ## Consequences
 
