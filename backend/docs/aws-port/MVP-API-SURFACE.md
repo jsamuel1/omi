@@ -34,20 +34,40 @@ each route was classified by reading its callers.
    `app/lib/`, plus the helper-built URLs, added 24 pairs the first pass missed
    (among them the static map, health probe, knowledge graph, memory search,
    calendar events, referral campaign, payment webviews, developer and MCP
-   keys, and the speech-profile upload). The census therefore covers 315
-   client method+path pairs. Each was matched to its decorator. Five strings
-   match no decorator: one real call and four URL builders or debug strings,
-   all listed under [No backend route](#no-backend-route).
+   keys, and the speech-profile upload). A third pass, after review, followed
+   every URL built from a local base variable (`root`, `baseUrl`, `base`,
+   `_baseUrl`) and every native call under `app/ios/Runner/` and
+   `app/android/`. It added the client telemetry batch, the transcript and
+   Limitless import uploads, the Siri App Intent calls (`OmiNativeAPI`) and one
+   external share-service call. The census therefore covers 320 client
+   method+path pairs. Each was matched to its decorator. Seven strings match no decorator: one real call, four URL builders
+   or debug strings, the Siri debug probe and the external share-service call,
+   all listed under [No backend route](#no-backend-route) or the appendix.
 4. **Chains.** For each matched handler, the `database.*` modules it imports to
    depth 3 give the collections it touches. The shared auth baseline (Redis,
    `users`, `client_devices`) is subtracted. Rows below name the stores the
    handler itself writes or reads.
 5. **Reach.** For every pair, the client function's callers were followed to a
    mounted page or a startup path. A route is **in** when it is called on a
-   signed-in startup, by a mounted MVP screen, or by a primary control on one.
-   It is **cut** when its feature is cut and the client was checked to tolerate
-   a 404. Every other pair is **not reached** and is listed, with its reason,
-   in the [partition appendix](#partition-appendix).
+   signed-in startup, on a lifecycle event of a mounted MVP screen (Home's
+   foreground resume, the chat page's open), by a mounted MVP screen, or by a
+   primary control on one. A call guarded by a platform, permission or
+   server-state condition counts as reached when the guard can hold for the
+   owner on a supported device; the row names the guard and says
+   "Conditional". Only a guard that cannot hold under the fork's switches
+   (a compile-time define left off, a server state the cut routes cannot
+   create) makes a call **not reached**, and the appendix row names it. It is
+   **cut** when its feature is cut and the client was checked to tolerate a
+   404. Every other pair is **not reached** and is listed, with its reason, in
+   the [partition appendix](#partition-appendix).
+
+   The third pass swept every guarded call reachable from startup, Home resume
+   and the chat page open: the task and app integration loads, the Apple
+   Reminders resume sync, the Apple Health chat-open sync, the automatic
+   Reminders export on task create, the Siri owner-wide refresh, the fair-use
+   reconcile on resume, the cutover re-bind and the client telemetry
+   transport. The resulting rows are in sections 1, Home and 6, and the
+   appendix rows for fair use and client telemetry.
 
 **MVP screens.** Startup (`main.dart`, `core/app_shell.dart:420`
 `_initializeProviders`, `mobile/mobile_app.dart`, first-run onboarding), the
@@ -101,7 +121,9 @@ until that control is read, so this route fails closed. `_initializeProviders`
 unless that call is an `ApiSuccess` with no pending deletion (line 429). It then
 starts, without awaiting, the speech-profile check, the language list, the
 user and people providers, the message refresh, the subscription fetch, and the
-task-integration and integration loads (lines 431-451).
+task-integration and integration loads (lines 431-451). On Apple platforms the
+task-integration load can also write the Apple Reminders connection (the
+`PUT /v1/task-integrations/{app_key}` row below).
 
 | Method and path | Client caller | Backend handler | Store / providers | MVP |
 | --- | --- | --- | --- | --- |
@@ -113,7 +135,8 @@ task-integration and integration loads (lines 431-451).
 | `GET /v1/users/training-data-opt-in` | `users.dart:628`, via `user_provider.dart:178` | `routers/users.py:1151` | `users/{uid}` (opt-in field) | in |
 | `GET /v1/users/people` | `users.dart:383`, via `PeopleProvider.initialize` (`app_shell.dart:436`) and `HomeProvider.setUserPeople` | `routers/users.py:705` | `u/people`, plus signed URLs for speech samples in S3 `BUCKET_SPEECH_PROFILES` (`utils/other/storage.py:453`) | in |
 | `GET /v1/users/me/subscription` | `users.dart:695`, via `providers/usage_provider.dart` `fetchSubscription`, called at `app_shell.dart:447` and `pages/home/page.dart:131` | `routers/users.py:1283` | `users/{uid}.subscription`. The `is_marketplace_reviewer(uid)` branch (`users.py:1437`) returns before any Stripe call. Otherwise `reconcile_basic_plan_with_stripe` (`utils/subscription.py:1765`) calls Stripe only for a basic or lapsed plan that carries a `stripe_subscription_id`, which the seeded owner does not | in. The paywall bails when `showSubscriptionUI` is false (`home/page.dart:140`) |
-| `GET /v1/task-integrations` | `backend/http/api/task_integrations.dart:29`, via `TaskIntegrationProvider.loadFromBackend` at `app_shell.dart:448` | `routers/task_integrations.py:233` | `u/task_integrations` (`database/users.py:2108`) | in. Non-200 sets a provider load error and the app continues |
+| `GET /v1/task-integrations` | `backend/http/api/task_integrations.dart:29`, via `TaskIntegrationProvider.loadFromBackend` at `app_shell.dart:448` | `routers/task_integrations.py:233` | `u/task_integrations` (`database/users.py:2097`) and the default-app field (`database/users.py:2192`) | in. Non-200 sets a provider load error and the app continues |
+| `PUT /v1/task-integrations/{app_key}` (`app_key=apple_reminders`) | `task_integrations.dart:72-77` `saveTaskIntegration`, via `TaskIntegrationProvider.saveConnectionDetails` (`providers/task_integration_provider.dart:241-244`). The same startup load calls it on Apple platforms: `loadFromBackend` defaults `refreshApplePermission` to true, reads the EventKit permission, and when it is granted but the server lacks `apple_reminders.connected`, writes `{connected: true}` (`task_integration_provider.dart:123-130`) | `routers/task_integrations.py:261` `save_task_integration` | `u/task_integrations/apple_reminders` (`database/users.py:2137` `set_task_integration`) | in. Conditional: iOS with Reminders permission already granted. A non-200 returns `false` and startup continues |
 | `GET /v1/integrations/{app_key}` | `backend/http/api/integrations.dart:29`, via `IntegrationProvider.loadFromBackend` at `app_shell.dart:451` | `routers/integrations.py:293` | `u/integrations/{app_key}` (`database/users.py:2241`) | in. Same tolerance as above |
 | `PATCH /v1/users/geolocation` | `users.dart:169`, called from `pages/home/page.dart:450` and the capture path | `routers/users.py:444` | Redis geolocation cache only | in |
 | `GET /v1/users/onboarding` | `backend/http/api/users.dart:900` `getUserOnboardingState`, called from `services/auth_service.dart:965` and `pages/home/page.dart:641` | `routers/users.py:606` | `users/{uid}` (onboarding fields) | in |
@@ -145,11 +168,15 @@ guided voice and the knowledge-graph prebuild, are debug-only.
 
 ### Home
 
-These run when Home and the conversation list mount.
+These run when Home and the conversation list mount, or when Home sees a
+foreground resume (`pages/home/page.dart:399-428`).
 
 | Method and path | Client caller | Backend handler | Store / providers | MVP |
 | --- | --- | --- | --- | --- |
-| `GET /v1/action-items` | `backend/http/api/action_items.dart:78` `tryGetActionItems`, via `ActionItemsProvider.fetchActionItems` (411) and `ensureLoaded` (276), called from Home | `routers/action_items.py:582` | `u/action_items` | in |
+| `GET /v1/action-items` | `backend/http/api/action_items.dart:78` `tryGetActionItems`, via `ActionItemsProvider.fetchActionItems` (411) and `ensureLoaded` (276), called from Home and by `forceRefreshActionItems` after the Apple Reminders resume sync (`pages/home/page.dart:423-426`). On iOS with Siri enabled, `SiriIntegration._refreshOwnerWideTasks` (`services/siri_integration.dart:621`) pages it through `ActionItemsApi.list` after sign-in (`_scheduleOwnerWideRefresh`, 581) and after a confirmed Reminders batch (`queueRefreshAuthoritativeTasks`, 479) | `routers/action_items.py:582` | `u/action_items` | in |
+| `GET /v1/action-items/pending-sync?platform=apple_reminders` | `action_items.dart:472` `getPendingSyncItems`, from `AppleRemindersSyncService.syncOnForegroundResume` (`services/integrations/apple_reminders_sync_service.dart:40-48`). Home runs that on every foreground resume on Apple platforms when the selected task app is Apple Reminders (`pages/home/page.dart:419-426`), which is the constructor default on Apple (`task_integration_provider.dart:45-47`). The service returns early without EventKit permission (43) and inside a 30 s cooldown (42) | `routers/action_items.py:240` `get_pending_sync_items`, then `database/action_items.py:1061` `get_pending_apple_reminders_sync` | `u/action_items`: two equality queries (`sync_requested == true`, and `export_platform == apple_reminders` with `exported == true`). The adapter must serve these equality filters (ADR-001, "Document store: Aurora Serverless v2 PostgreSQL, not DynamoDB") | in. Conditional: iOS with Reminders permission. A non-200 returns null and the sync stops (49) |
+| `PATCH /v1/action-items/sync-batch` | `action_items.dart:491` `syncBatchUpdate`, from the same service: outbound export (`apple_reminders_sync_service.dart:93-94`) and pulled completions, titles and due dates (194-200) | `routers/action_items.py:259` `sync_batch_update`, then `database/action_items.py:1103` `batch_sync_update_action_items` | `u/action_items` (pre-read per id, then per-document updates through `FirestoreActionItems.sync_update_documents`), a vector upsert for renamed items (`upsert_action_item_vectors_batch`, cut so a no-op), and `utils/notifications.py:829` `sync_action_item_reminder` per changed row, which sends an FCM data message to zero tokens because push is cut | in. Conditional, as above. A non-200 returns `false`; the reminders already created stay unlinked and are retried as pending export next resume |
+| `DELETE /v1/action-items/{action_item_id}` (Reminders unlink) | `action_items.dart:361` `deleteActionItem`, passed as `deleteTask` at `apple_reminders_sync_service.dart:198` for a linked reminder the user deleted in Reminders | `routers/action_items.py:907` | Same as the section 4 row | in. Same route as section 4 |
 | `GET /v1/pending-work` | `backend/http/api/pending_work.dart:20`, called from `pages/conversations/conversations_page.dart:399` | `routers/pending_work.py:33` | Rows from `database/processing_attention.py` and `database/sync_jobs.py` | in. The client treats 404 as empty |
 | `GET /v1/attention-items` | `pending_work.dart:47`, same caller | `routers/pending_work.py:64` | Rows from `database/processing_attention.py` | in |
 | `GET /v1/users/daily-summaries?limit=1` | `users.dart:787`, via `providers/conversation_provider.dart:696` `checkHasDailySummaries`, run by `getInitialConversations` (1107) from `conversations_page.dart:889` | `routers/users.py:2076` | Daily summaries under `users/{uid}` (`database/daily_summaries.py`) | in. Empty list on a fresh account |
@@ -344,6 +371,7 @@ is cut and becomes a no-op.
 | `POST /v2/chat/generate-title` | `chat_sessions.dart:91` `title`, called from `chat_history_state.dart:172` | `routers/chat_sessions.py:345` | LLM via `get_llm`, writes `u/chat_sessions/{id}` (`title`), `u/llm_usage` | in |
 | `POST /v2/files` | `messages.dart:373`, via `providers/message_provider.dart:575` `uploadFiles` from the chat attachment control | `routers/chat.py:1518` | See the upload chain below | in |
 | `POST /v2/files/video` | `messages.dart:396`, same caller for video attachments | `routers/chat_video.py:57` | See the upload chain below | in |
+| `PUT /v1/integrations/apple-health/sync` | `backend/http/api/integrations.dart:111` `syncAppleHealthData`, from `AppleHealthService.syncHealthDataToBackend` (`services/integrations/apple_health_service.dart:252`). Every chat-page open runs `_syncAppleHealthIfConnected` (`pages/chat/page.dart:155,274-285`), which awaits `IntegrationProvider.ensureLoaded` and syncs seven days when the server says `apple_health` is connected | `routers/integrations.py:351` `sync_apple_health_data` | `u/integrations/apple_health` (`database/users.py:2249` `set_integration`) | in. Conditional: iOS with Apple Health connected. A fresh account has no `apple_health` row, so the startup read reports it disconnected and the sync does not run until the user connects it in settings |
 | `POST /v2/messages/device-tool/{call_id}/result` | `services/device_tools/device_tool_dispatcher.dart:152` `_postResult`, created per streamed reply at `messages.dart:283` | `routers/chat.py:273`, then `utils/device_tools.py:183` | Redis in-flight and result keys with a TTL | in |
 | `POST /v1/users/analytics/chat_message` | `users.dart:485` `setMessageResponseRating`, via `MessageProvider.setMessageNps` (609), from the rating control at `pages/chat/page.dart:1408` | `routers/users.py:840` | `u/messages/{id}` (`rating`) | in |
 | `POST /v1/chat/receipts/{receipt_id}/undo` | `pages/chat/widgets/content_blocks/edit_receipt_block.dart:100` | `routers/chat_receipts.py:13`, then `utils/messaging/undo.py:20` `UndoStore` | `u/chat_receipts` (`undo.py:37`) and the record the receipt names | in |
@@ -452,13 +480,12 @@ reason). Grouped by client file.
 
 | Client file | Routes | Bucket and reason |
 | --- | --- | --- |
-| `backend/http/api/users.dart` | `GET /v1/fair-use/status` (`users.dart:1007`, `routers/fair_use_admin.py:271`) | not reached. Called from `sync_upload_gate.dart:127` and `main.dart:638` only when persisted fair-use state exists, and `FAIR_USE_ENABLED=false` never creates it |
+| `backend/http/api/users.dart` | `GET /v1/fair-use/status` (`users.dart:1007`, `routers/fair_use_admin.py:271`) | not reached. Every caller, including the resume path (`main.dart:638`, `SyncUploadGate.reconcileFairUseStatus`, `services/wals/sync_upload_gate.dart:127-129`), returns before the request unless `SyncRateLimiter.hasPersistedFairUseState` is set. Only a fair-use refusal from the sync upload routes persists that state (`sync_job_poller.dart:255`), those routes are cut and answer 404, and `FAIR_USE_ENABLED=false` means the server never returns that refusal |
 | `backend/http/api/users.dart` | `GET /v1/users/me/usage` (`users.dart:611`) | not reached. Usage page only |
 | `backend/http/api/conversations.dart` | `GET /v1/conversations/{conversation_id}/suggested-apps` (`routers/conversations.py:2554`) | not reached. Only the app summary sheet calls it, and that needs the cut app catalog |
 | `backend/http/api/messages.dart` | `POST /v2/messages/{message_id}/report` (`routers/chat.py:308`) | not reached. No caller outside the API file |
 | `backend/http/api/review.dart`, `open_loops.dart` | `POST /v2/review/items/{item_id}/answer`, `POST /v1/review/open-loops/{date}/{card_id}/answer` | cut. `review`. With Review off the cards that answer never render |
 | `backend/http/plan_storefront_api.dart` | `GET /v2/payments/plans` | cut. `storefront` |
-| `backend/http/api/action_items.dart` | `GET /v1/action-items/pending-sync`, `PATCH /v1/action-items/sync-batch` | not reached. Apple Reminders sync (`services/integrations/apple_reminders_sync_service.dart`) is a Tasks-tab integration |
 | `backend/http/api/action_items.dart` | `GET /v1/action-items/shared/{token}`, `POST /v1/action-items/accept` | not reached. Only the shared-tasks deep link (`core/app_shell.dart:264`) and its accept sheet call them |
 | `backend/http/api/action_items.dart` | `PATCH /v1/action-items/batch`, `POST /v1/action-items/batch-delete` | not reached. Task reorder (`ActionItemsProvider._flushSortUpdates`) and bulk delete (`task_selection_action_bar.dart:164`) are Tasks-tab controls |
 | `backend/http/api/apps.dart`, `backend/http/api/payment.dart` (app subscriptions) | every `/v1/apps*`, `/v2/apps*`, `/v1/app/*`, `/v1/app-*` route, including `POST /v1/apps/enable` from `conversation_summary_generation.dart:327`, `POST /v1/app/thumbnails` and `POST /v1/apps/migrate-owner` (Google or Apple account linking, `auth_provider.dart:385,407`) | cut. `apps`, `developer`, `developer_key`, `payment` |
@@ -474,8 +501,8 @@ reason). Grouped by client file.
 | `backend/http/api/dream.dart` | `GET /v1/dream/runs`, `POST /v1/dream/runs` | cut. `dream_report` |
 | `backend/http/api/folders.dart` | `POST /v1/folders/reorder` | not reached. `FolderProvider.reorderFolders` (185) has no UI caller |
 | `backend/http/api/goals.dart` | every other `/v1/goals*` route (the canonical create is in section 1) | not reached. Goals live on the Goals page and the Tasks tab |
-| `backend/http/api/imports.dart` | `GET /v1/import/jobs`, `DELETE /v1/import/limitless/conversations` | not reached. Import history settings page only |
-| `backend/http/api/integrations.dart` | `PUT /v1/integrations/{app_key}`, `DELETE /v1/integrations/{app_key}`, `PUT /v1/integrations/apple-health/sync` | not reached. Integrations settings and the Apple Health service only |
+| `backend/http/api/imports.dart` | `GET /v1/import/jobs`, `POST /v1/import/transcripts` (`imports.dart:142` `transcriptImportUrl`), `POST /v1/import/limitless`, `DELETE /v1/import/limitless/conversations` | not reached. `getImportJobs`, `startTranscriptImport` and `startLimitlessImport` are called only from `pages/settings/import_history_page.dart` |
+| `backend/http/api/integrations.dart` | `PUT /v1/integrations/{app_key}`, `DELETE /v1/integrations/{app_key}` | not reached. `IntegrationProvider.saveConnection` and `deleteConnection` are called from the integrations settings pages only. `PUT /v1/integrations/apple-health/sync` is in (section 6) |
 | `backend/http/api/knowledge_graph_api.dart` | `POST /v1/knowledge-graph/rebuild` | not reached. Only `prebuildForOnboarding` (133) calls it, from the control onboarding arm (`pages/onboarding/wrapper.dart:177`); release builds use the Pocket arm (`onboarding_variant_gate.dart:109`) |
 | `backend/http/api/messaging_channels.dart` | every `/v1/messaging/*` route | cut. `messaging` |
 | `backend/http/api/payment.dart`, `payments.dart`, `budget_choice_api.dart`, `plan_storefront_api.dart`, `pages/settings/payment_webview_page.dart` | every `/v1/payments/*`, `/v1/payment-methods/*`, `/v1/stripe/*`, `/v1/paypal/*` and `/v2/payments/plans` route | cut. `payment`, `retention_offer`, `yearly_switch`, `redeem_code`, `storefront`. The chat budget pause reads the storefront only when two PostHog flags are on (`services/experiments/plan_storefront_gate.dart:13-16`), which fail to `false` without PostHog |
@@ -487,7 +514,7 @@ reason). Grouped by client file.
 | `backend/http/api/review.dart` | `GET /v1/entities`, `GET /v1/entities/{entity_id}/page`, `POST /v1/entities/{entity_id}/corrections`, `POST /v1/review/changes/{change_id}/undo`, `POST /v1/review/changes/{change_id}/redo` | cut. `review` |
 | `backend/http/api/speaker_tag_prompts.dart` | `GET /v1/speaker-tag-prompts`, `POST /v1/speaker-tag-prompts/shown`, `/dismiss`, `/answer`, `/ignored-voices*`, `GET`/`PATCH /v1/users/voice-profile-settings` | not reached. `SpeakerTagPromptsProvider.loadIfDue` (175) has no external caller, and the settings are read only by `voice_profile_settings_section.dart:38` |
 | `backend/http/api/speech_profile.dart`, `pages/onboarding/guided_voice_requests.dart`, `guided_voice_io.dart` | `GET /v4/speech-profile`, `POST /v3/upload-audio`, `GET`/`DELETE /v3/speech-profile/expand`, `GET /v3/speech-profile/stt-availability`, plus `POST /v2/voice-message/transcribe` from the guided voice flow | cut. `OMI_DISABLED_ROUTES` entries. The voice-profile flow (`openVoiceProfile`, `settings_destinations.dart:160`) is opened from the Home speech-profile card. Its preflight treats a 404 as unavailable and shows `transcription_unavailable` (`guided_voice_controller.dart:258-264,313-315`); the reader can skip |
-| `backend/http/api/task_integrations.dart` | `PUT /v1/task-integrations/{app_key}`, `PUT /v1/task-integrations/default`, `DELETE /v1/task-integrations/{app_key}`, `POST /v1/task-integrations/{app_key}/tasks`, and the Asana and ClickUp listing routes | not reached. `TaskIntegrationsPage` is opened from the Tasks tab header (`pages/home/page.dart:993-1007`) and settings |
+| `backend/http/api/task_integrations.dart` | `PUT /v1/task-integrations/default`, `DELETE /v1/task-integrations/{app_key}`, `POST /v1/task-integrations/{app_key}/tasks`, and the Asana and ClickUp listing routes. `PUT /v1/task-integrations/{app_key}` is in (section 1) | not reached. `setSelectedApp` is called only from `TaskIntegrationsPage` (opened from the Tasks tab header, `pages/home/page.dart:1001-1007`, and settings) and `integration_settings_page.dart`. `createTaskViaIntegration` runs only from `ActionItemExportService` (`pages/action_items/services/action_item_export_service.dart`), whose bulk export is the Tasks-tab selection bar (`task_selection_action_bar.dart:124`). The automatic Apple Reminders export on task create (`automatic_apple_reminders_export.dart`) uses only `GET /v1/task-integrations` and `PATCH /v1/action-items/{action_item_id}`, both in |
 | `backend/http/api/task_suggestions.dart` | every `/v1/candidates*` route | not reached. `TaskSuggestionsController.load` is called from the Tasks tab (`action_items_page.dart:102`). `POST /v1/candidates/from-conversation` runs only for desktop-source conversations (`summary_task_recovery.dart`) |
 | `backend/http/api/users.dart` | `PATCH /v1/users/people/{person_id}/name`, `PATCH /v1/users/people/{person_id}/pinned`, `DELETE /v1/users/people/{person_id}`, `DELETE /v1/users/people/{person_id}/speech-samples/{sample_index}` | not reached. People settings pages only (`pages/settings/people.dart`, `person_detail_page.dart`, `widgets/people_list.dart`) |
 | `backend/http/api/users.dart` | `POST /v1/users/private-cloud-sync`, `POST /v1/users/training-data-opt-in` | not reached. The private cloud sync page and the training-data settings only |
@@ -498,6 +525,9 @@ reason). Grouped by client file.
 | `backend/http/api/users.dart` | `PUT /v1/users/preferences/app` | not reached. It sets a summary template, and the template list comes from the cut app catalog (`fetchInstalledSummaryApps` fails), so no template can be chosen |
 | `backend/http/api/wrapped.dart` | `GET /v1/wrapped/{year}`, `POST /v1/wrapped/{year}/generate` | not reached. The Wrapped page opens only from a deep link (`home_deep_links.dart:279`) |
 | `backend/http/user_data_export.dart` | `GET /v1/users/export` | not reached. Data export settings only |
+| `services/telemetry/client_telemetry_transport.dart` | `POST /v1/telemetry/client/batches` (`client_telemetry_transport.dart:54`, `routers/client_telemetry.py:87`) | not reached. `installClientTelemetryTransport` runs at `main.dart:598` only when `ClientTelemetryFlags.migrationEnabled`, a compile-time `OMI_CLIENT_TELEMETRY_MIGRATION` define that defaults false (`client_telemetry_flags.dart:8,22`). The fork's builds do not set it. If set, the route writes through `database/client_telemetry.py::accept_batch` and stays mounted |
+| `ios/Runner/SiriIntegration/` (native Swift, outside `app/lib/`) | `POST /v3/memories` (`SiriIntents.swift:36,328`), `POST /v1/action-items` (594), `PATCH /v1/action-items/{action_item_id}` (533), `POST /v2/messages` (`SiriSession.swift:234`) | in. These are the same routes as sections 4 to 6, called by Siri App Intents when the user invokes one. `POST /v1/memories` in `SiriDebugProbe.swift:378` is a debug probe that runs only when the app is launched with a `-omi-siri-probe*` argument (`SiriDebugProbe.runIfRequested`, 214-231), and matches no decorator |
+| `services/agent_connect/zkr_share.dart` | `POST /api/v1/secrets` on `https://zkr.scalingforever.com` | Not an Omi backend route. External share service, called from developer agent-connect settings only |
 | `pages/settings/device_diagnostics.dart` | `POST /v1/mobile/device-diagnostics` | not reached. "Send to support" on the diagnostics page under device settings; a manual support action. If used, it writes to `BUCKET_PRIVATE_CLOUD_SYNC` (`utils/other/device_diagnostics_storage.py:14`) and works unchanged |
 | `services/on_device/on_device_segment_upload.dart` | `POST /v1/conversations/from-segments` | cut. `developer`. On-device transcription defaults off, so `on_device_runner.dart` never uploads |
 | `backend/http/api/phone_calls.dart:109` | the `source=phone_call` variant of `/v4/listen` | cut with `phone_calls`. The phone call page needs `POST /v1/phone/token` first, so it cannot open the socket |
