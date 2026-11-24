@@ -65,8 +65,8 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py` gains `redis_tls_kwargs()` and a `REDIS_DB_TLS` switch, and every production constructor routes through it (see "Valkey: TLS on every client") | No |
 | Soniox / Modulate streaming STT | Amazon Transcribe streaming over a raw SigV4 WebSocket on Python 3.11, as a new `transcribe` provider and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | The closed STT policy seams listed under "STT: seam contract" | No |
 | OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `bedrock` provider), `utils/llm/clients.py::get_llm` (762), `utils/llm/model_config.py` (new `MODEL_QOS` profile) | No |
-| OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings` | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) | No |
-| OpenAI Files (chat attachments) | S3 `BUCKET_CHAT_FILES` for the bytes, sent to Bedrock Converse as image and document content blocks | Keeping OpenAI Files (not an AWS service, and a second LLM vendor for one feature) | `utils/other/chat_file.py` `FileChatTool.upload` (249), `upload_video`, `_ask_files_stream` (397), `_ask_files` (462), `download_owned_chat_file` (115) | No |
+| OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings`. Titan takes at most 8,192 tokens or 50,000 characters per input, and the direct path has no truncation today (`_fit_openai_embedding_text`, `utils/llm/gateway_client.py:726`, runs only on the gateway path). The proxy cuts each input to its first 24,000 characters (8,192 tokens at a conservative 3 characters per token, below the 50,000-character cap) and maps an empty string to one space. On the MVP path the only caller is `save_structured_vector` (`utils/conversations/process_conversation.py:2191`), whose failure the finalizer already absorbs (`utils/conversations/finalizer.py:102-130`) | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) | No |
+| OpenAI Files (chat attachments) | S3 `BUCKET_CHAT_FILES` for the bytes, sent to Bedrock Converse as image and document content blocks, with upload admission narrowed to what Converse accepts (see "Attach contract") | Keeping OpenAI Files (not an AWS service, and a second LLM vendor for one feature) | `utils/other/chat_file.py` `FileChatTool.upload` (262), `upload_video`, `_ask_files_stream` (397), `_ask_files` (462), `download_owned_chat_file` (115); `models/chat.py` `chat_file_is_document` | No |
 | Gemini / ElevenLabs TTS (`/v2/tts/synthesize`) | Cut for MVP. Amazon Polly later | Polly now (the client already falls back to the system voice) | `routers/tts.py` | No |
 | Pinecone (conversation vectors) | Cut for MVP. pgvector on the same Aurora cluster later | OpenSearch Serverless (OCU minimum is a standing cost for one user) | `database/vector_db.py` (`PINECONE_API_KEY`/`PINECONE_INDEX_NAME` at 144-155) | No |
 | Typesense (conversation search) | Cut for MVP. Postgres full-text search later | OpenSearch managed domain (standing instance cost) | `utils/conversations/search.py::search_conversations` (342) | No |
@@ -410,6 +410,7 @@ New packages and the image that reaches each one:
 | `anthropic[bedrock]` extra | `AsyncAnthropicBedrock` in `utils/retrieval/agentic.py` | change `anthropic>=0.52.0` to `anthropic[bedrock]>=0.52.0` | same change. The bare `anthropic` pin is already in both files |
 | `PyJWT` | `verify_token` in `utils/other/endpoints.py` | already pinned (`requirements.txt:173`) | not added. Pusher does not import `endpoints.py`. The closure probe below confirms it |
 | `certifi` | `database/redis_connection.py::redis_tls_kwargs` CA bundle (see "Valkey: TLS on every client") | already pinned (`requirements.txt:23`) | add `certifi==2026.10.18` |
+| `pypdf` | PDF page count in `FileChatTool.upload` (see "Attach contract") | add | add. Pusher's image already carries `chat_file` through `tools/__init__` → `file_tools` (`pusher/requirements.txt:92`), so the import closure reaches it |
 
 Every package uses the same pin in both files. `psycopg[binary]==3.2.10`,
 `redis==5.0.8` and `websockets==12.0` are already in both. After editing both
@@ -456,7 +457,7 @@ requirement files, run `backend/scripts/update-python-lock.sh`. It regenerates
 ### Chat files: S3 plus Bedrock content blocks
 
 `POST /v2/files` and `/v2/files/video` upload attachments to OpenAI Files today
-(`utils/other/chat_file.py:249` and 343), and the answer path calls OpenAI chat
+(`utils/other/chat_file.py:262` and 343), and the answer path calls OpenAI chat
 completions directly (`_ask_files_stream` at 397, `_ask_files` at 462).
 
 - Store the bytes in `BUCKET_CHAT_FILES` under `{uid}/files/{file_id}`. Keep
@@ -465,8 +466,164 @@ completions directly (`_ask_files_stream` at 397, `_ask_files` at 462).
   filmstrip goes to `{uid}/files/{file_id}.strip.jpg`, and that key replaces
   the OpenAI id in `video.strip_file_id`.
 - At answer time, read the object and send it to `ChatBedrockConverse` as an
-  image or document content block, replacing both `_ask_files*` paths.
+  image or document content block, replacing both `_ask_files*` paths. What
+  the upload may store, and how many blocks one request may carry, follow the
+  attach contract below.
 - Thumbnails and deletion follow the private-object contract below.
+
+#### Attach contract: admit only what Converse accepts
+
+The current upload admits what OpenAI Files accepts, and the answer path
+finds out later. `/v2/files` takes parts up to 50 MiB
+(`utils/multipart.py:19` `CHAT_FILE_MAX_PART_SIZE`, `routers/chat.py:1519`).
+Its document test is `chat_file_is_document` over
+`CHAT_FILE_DOCUMENT_EXTENSIONS` (`models/chat.py:69-206`), and its image test
+is any `image/*` MIME that Pillow can open (`chat_file.py:230`, `:270-283`).
+Converse is narrower
+([DocumentBlock](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_DocumentBlock.html),
+[ImageBlock](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ImageBlock.html),
+[Message](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Message.html),
+[inference restrictions](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-api-restrictions.html)):
+
+- Document `format` is one of `pdf`, `csv`, `doc`, `docx`, `xls`, `xlsx`,
+  `html`, `txt`, `md`. Each document is at most 4.5 MB, and a message carries
+  at most 5. The document `name` allows only letters, digits, single spaces,
+  hyphens, parentheses and square brackets, and AWS advises a neutral name
+  because the model reads it.
+- Image `format` is one of `png`, `jpeg`, `gif`, `webp`. Each image is at
+  most 3.75 MB and 8000 × 8000 px, and a message carries at most 20. Claude
+  reads only the first frame of an animated GIF.
+- A message that carries a document also carries a text block.
+- The whole request stays under the 25 MB invocation quota.
+
+Uploads that pass today and would fail at answer time include every PPTX the
+app's picker offers (`app/lib/providers/message_provider.dart:487-508`), PPT,
+RTF, ODT, every code suffix, any document over 4.5 MB, and BMP or TIFF photos.
+The port moves every one of those checks to upload time, so a file that is
+stored can always be sent.
+
+**Admission table.** `FileChatTool.upload` classifies each file once, by
+suffix, or by MIME when the name has no suffix, exactly as
+`chat_file_is_document` does today. It records the result in a new
+`bedrock_format` field on `FileChat`. The answer path reads that field and
+never re-derives the format.
+
+| Class | Inputs | Stored object | `bedrock_format` |
+| --- | --- | --- | --- |
+| Native document | `pdf`, `csv`, `doc`, `docx`, `xls`, `xlsx`, `html`/`htm`, `txt`/`text`, `md`/`markdown` | original bytes | the matching Converse format (`htm` → `html`, `text` → `txt`, `markdown` → `md`) |
+| Text document | every other suffix in the "Text and code" group of `CHAT_FILE_DOCUMENT_EXTENSIONS` (code, config, `json`, `xml`, `yaml`, `log`, `srt`, `vtt`, `ics`, `vcf`, `eml`, `mht`/`mhtml`, `mime`, `nws` and the rest), plus `tsv` and `iif` | original bytes, after a check that they decode as strict UTF-8 (BOM allowed) and contain no NUL byte | `txt` |
+| Converted document | `pptx`, or MIME `application/vnd.openxmlformats-officedocument.presentationml.presentation` | Markdown text extracted from the slides (below) | `md` |
+| Native image | Pillow `img.format` of `JPEG`, `PNG`, `GIF` or `WEBP` | original bytes, unless the size rule below re-encodes them | `jpeg`, `png`, `gif`, `webp` |
+| Converted image | any other format Pillow opens (`BMP`, `TIFF`, `ICO`, `MPO`, `PPM` and the rest) | first frame re-encoded: PNG when it has an alpha channel, otherwise JPEG at quality 90 | `png` or `jpeg` |
+| Rejected | `ppt`, `pot`, `pps`, `ppa`, `pwz`, `wiz`, `dot`, `odt`, `rtf`, `xla`, `xlb`, `xlc`, `xlm`, `xlt`, `xlw`; the Apple iWork and Google Apps MIME types; a text document that is not UTF-8; an image Pillow cannot open (HEIC, as today); everything else | nothing | n/a. 400 |
+
+The image class goes by what Pillow decodes, not by the file name. A
+converted image's row `mime_type` becomes `image/png` or `image/jpeg`, so the
+client's `mimeTypeToFileType` (`schema/message.dart:124`), the thumbnail and
+the answer path all agree on one format. Videos keep their route. The sheet
+and filmstrip are JPEGs `video_frames.py` builds (383, 396).
+
+**Size limits after classification:**
+
+- **Upload part.** Stays at 50 MiB, which video clips need. It bounds the
+  bytes read before classification, not what is stored.
+- **Documents.** The stored object is at most 4,500,000 bytes, otherwise 400.
+  A PDF must also open with `pypdf` and have at most 100 pages, otherwise 400.
+  The count goes into a new `page_count` field. `UNVERIFIED`: whether the
+  100-page Claude limit and the 4.5 MB cap apply to PDFs sent without
+  citations through Converse. AWS says Claude 4 lifts the 4.5 MB cap for
+  PDFs, but the console still enforces it, so the port keeps both limits.
+- **PPTX extraction.** Read the archive with `zipfile`: at most 1,000
+  members, each `ppt/slides/slide*.xml` part at most 10 MB decompressed and
+  50 MB in total, and any part containing `<!DOCTYPE` is refused. Parse the
+  slides in numeric order with `xml.etree.ElementTree`. Write `## Slide N`
+  followed by the slide's `a:t` runs, one paragraph per `a:p`. Speaker notes
+  and images are dropped. An archive that breaks a bound, or yields no text,
+  gets a 400. The Markdown must fit the 4.5 MB document cap.
+- **Images.** The stored object is at most 3,750,000 bytes and 8000 px on
+  each side. A larger image is downscaled once, deterministically, to a
+  2048 px longest edge (`Image.thumbnail`, `LANCZOS`). It is re-encoded in
+  its own format: JPEG and WebP at quality 85, PNG with `optimize=True`,
+  and GIF as its first frame in PNG. The row's `mime_type` and
+  `bedrock_format` follow the stored bytes, so an oversized GIF becomes
+  `image/png` and `png`. A result still over the cap gets a 400.
+  The video sheet, the filmstrip and `window_sheet` output go through the
+  same check before they are stored or sent.
+
+**User-visible failure.** Every rejection raises `UnsupportedChatFileError`
+with a reason the user can act on. For example: "'.pptx' files over 4.5 MB
+of text can't be read in chat", "PDFs over 100 pages aren't supported in
+chat", or "'.rtf' files aren't supported in chat. Save it as PDF or DOCX."
+The routes already turn that error into a 400 with the text as `detail`
+(`routers/chat.py:1544-1545`, `:1619-1620`). The client drops it today:
+`_uploadFilesBatch` (`backend/http/api/messages.dart:445-458`) throws a bare
+exception, and `uploadFiles` (`message_provider.dart:589-594`) shows the
+generic "Failed to upload file". In the port `_uploadFilesBatch` throws a
+`ChatFileRejectedException(detail)` on a 400 that carries a `detail`, and
+`uploadFiles` shows that detail in the snackbar. Other failures keep the
+generic text. The picker's `allowedExtensions` list is unchanged, because
+every suffix in it is in a retained class.
+
+**Answer-time request budget.** `get_chat_files_desc` returns up to 10 files,
+newest first (`_requested_file_limit`, `chat_file.py:244`). The new
+`_bedrock_blocks(question, files)` keeps that order. It takes:
+
+- the question as the first text block;
+- at most 5 documents, and PDFs only while their `page_count` total stays at
+  or below 100;
+- every image, never more than 10 from this list;
+- only while the inline bytes stay at or below 20 MB.
+
+Each included file has a text block naming it, followed by its content
+block. The document block's `name` is the neutral `document-{n}`, so user
+file names never reach the `name` field. Files that do not fit are listed in
+a final text block ("Not included in this request: report.pdf (document
+limit)"), so the model can ask the user to narrow the question. A row with
+no `bedrock_format` gets the existing `UnsupportedChatFileError` text and
+no provider call. No such row exists in the new store.
+
+**Bounded S3 reads.** Every attachment, strip and thumbnail read is a
+`GetObject` with `Range: bytes=0-{cap}`, where `cap` is the row's class
+limit (4,500,000 or 3,750,000). It refuses a response whose `ContentRange`
+total exceeds the cap. `download_owned_chat_file(max_bytes=...)` keeps its
+contract with the same read. A missing key (`NoSuchKey`) raises
+`StaleChatFileError`. A Converse `ValidationException` raises
+`ProviderRejectedChatFileError`. Because admission already enforces each
+file's format and size, `search_files_tool` treats that exception as a
+request-shape fault (`file_tools.py:198-211`): it logs at error level and
+returns its existing "I encountered an error while searching the files"
+reply. `_provider_400_names_request_field` reads OpenAI error fields and
+gets a Bedrock branch that always answers true.
+
+**Rejected: keep the OpenAI allowlist and let Converse reject at answer
+time.** The upload succeeds and shows a thumbnail. The failure arrives later,
+as a generic chat error the user cannot connect to the file.
+**Rejected: convert Office formats with headless LibreOffice.** It adds
+hundreds of MB to both images and a large parser for untrusted input, all
+for PPTX, which a bounded `zipfile` text extraction covers.
+
+**Tests (implementation card).**
+
+- A closed-world test walks every entry in `CHAT_FILE_DOCUMENT_EXTENSIONS`
+  and `CHAT_FILE_DOCUMENT_MIME_TYPES`. It asserts that each lands in exactly
+  one class of the admission table, and that every admitted class has a
+  Converse format. A new suffix cannot be admitted without one.
+- `tests/unit/test_messaging_modalities.py:365`
+  `test_documents_use_real_file_chat_allowlist` keeps `pptx` admitted, and
+  asserts `bedrock_format == 'md'` plus `## Slide 1` text from a fixture deck.
+- Upload: a 4,500,001-byte document, a 101-page PDF, a non-UTF-8 `.py`, an
+  `.rtf`, a PPTX zip bomb and a PPTX with a `DOCTYPE` each get 400 with their
+  reason. A 9000 px PNG is stored at 2048 px. A BMP is stored as JPEG with
+  `mime_type` `image/jpeg`.
+- Answer time: 6 documents produce 5 document blocks and an omission note.
+  Block names match `document-\d+`. The 20 MB budget and the 100-page PDF
+  budget each stop inclusion. An S3 object larger than its cap raises before
+  any provider call.
+- Flutter: a 400 with `detail` shows that text in the snackbar. A 500 shows
+  the generic text.
+- Deployed: one PDF, DOCX, XLSX, PPTX, Markdown, PNG, JPEG, GIF and WebP each
+  go through `POST /v2/files`. A `POST /v2/messages` asking about each one
+  returns an answer that quotes its content.
 
 #### Private chat thumbnails
 
@@ -481,7 +638,7 @@ return 403. The contract below replaces the public URL with an owner-checked
 backend route.
 
 **Object key.** The backend mints the key from the file id, never from the
-upload's file name: `{uid}/thumbnails/{file_id}.{jpg|png}`. The row stores it
+upload's file name: `{uid}/thumbnails/{file_id}.{ext}`. The row stores it
 in a new `thumbnail_key` field on `FileChat` (`models/chat.py:380`). Every key
 in the bucket starts with `{uid}/`, so the owner purge that account deletion
 already runs on `BUCKET_CHAT_FILES` (`storage.py:260`, prefix `{uid}/`) covers
@@ -495,12 +652,33 @@ removes a collision: the channel adapter names the thumbnail after the
 attachment's own name, so two photos named `image.jpg` overwrite each other's
 thumbnail today.
 
+**Thumbnail format.** `File.generate_thumbnail` (`chat_file.py:212-224`)
+saves the thumbnail in the source's Pillow format, so the thumbnail format is
+the stored image's format from the attach contract above. That is one of
+JPEG, PNG, GIF or WebP, because converted images are already PNG or JPEG. A
+video poster is always a JPEG (`_write_poster`, 309). One fixed map gives both
+the key suffix and the object's `ContentType`:
+
+| Pillow format | `{ext}` | `ContentType` |
+| --- | --- | --- |
+| `JPEG` | `jpg` | `image/jpeg` |
+| `PNG` | `png` | `image/png` |
+| `GIF` | `gif` | `image/gif` |
+| `WEBP` | `webp` | `image/webp` |
+
+An animated GIF's thumbnail is its first frame, saved as GIF. A format not in
+the map raises before any S3 write, which the attach contract makes
+unreachable. `upload_chat_thumbnail` sets `ContentType` on `PutObject`.
+The route serves the object's own `ContentType`, not the row's.
+
 **Fetch route.** A new `GET /v2/files/{file_id}/thumbnail` in
 `routers/chat.py` takes `auth.get_current_user_uid`. It reads the row with
 `chat_db.get_chat_files(uid, [file_id])`, so another user's id finds no row.
 It returns 404 when there is no row, no `thumbnail_key`, a key outside
-`{uid}/`, or no object. Otherwise it streams the object with the row's image
-content type, `Cache-Control: private, max-age=86400` and the object's ETag.
+`{uid}/`, a key whose suffix is not in the format map, or no object.
+Otherwise it streams the object with its stored `ContentType`,
+`X-Content-Type-Options: nosniff`, `Cache-Control: private, max-age=86400`
+and the object's ETag.
 The route needs an entry in `route_policy_manifest.yaml` beside `/v2/files`
 (line 87).
 
@@ -560,10 +738,14 @@ the URL's own expiry is later.
 
 **Tests (implementation card).**
 
-- Backend unit: upload writes `thumbnail_key = {uid}/thumbnails/{file_id}.<ext>`
+- Backend unit: upload writes `thumbnail_key = {uid}/thumbnails/{file_id}.{ext}`
   and the stable URL, with no ACL or `make_public` call, for all four callers.
-  Two channel photos with the same name get distinct keys.
-- Route: the owner gets 200 with bytes and content type. Another uid's file
+  Two channel photos with the same name get distinct keys. A test
+  parametrized over JPEG, PNG, GIF (animated and still), WebP and a BMP
+  source asserts the key suffix and `ContentType` from the format map. The
+  BMP lands as `jpg`. A video poster lands as `jpg`.
+- Route: the owner gets 200 with bytes and the stored content type for each
+  of the four formats, plus `nosniff`. A key with an unmapped suffix gets 404. Another uid's file
   id, a row without a key, a key outside `{uid}/` and a missing object each get
   404. A request without a token gets 401.
 - The embedded `files` copy read back from `u/messages` and through

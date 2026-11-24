@@ -418,7 +418,7 @@ is cut and becomes a no-op.
 | `POST /v2/chat/generate-title` | `chat_sessions.dart:91` `title`, called from `chat_history_state.dart:172` | `routers/chat_sessions.py:345` | LLM via `get_llm`, writes `u/chat_sessions/{id}` (`title`), `u/llm_usage` | in |
 | `POST /v2/files` | `messages.dart:373`, via `providers/message_provider.dart:575` `uploadFiles` from the chat attachment control | `routers/chat.py:1518` | See the upload chain below | in |
 | `POST /v2/files/video` | `messages.dart:396`, same caller for video attachments | `routers/chat_video.py:57` | See the upload chain below | in |
-| `GET /v2/files/{file_id}/thumbnail` (new in the port) | `pages/chat/widgets/files_handler_widget.dart:112` `_thumbnailImage`, through the new `ChatThumbnailImage` with the `Authorization` header, for every image or video attachment in a rendered message | new handler in `routers/chat.py`, `auth.get_current_user_uid` (ADR-001, "Private chat thumbnails") | `u/files/{id}` (`thumbnail_key`, owner-scoped read), then the S3 object `{uid}/thumbnails/{file_id}.<ext>` in `BUCKET_CHAT_FILES`. 404 for another user's id, a row without a key, or a missing object | in |
+| `GET /v2/files/{file_id}/thumbnail` (new in the port) | `pages/chat/widgets/files_handler_widget.dart:112` `_thumbnailImage`, through the new `ChatThumbnailImage` with the `Authorization` header, for every image or video attachment in a rendered message | new handler in `routers/chat.py`, `auth.get_current_user_uid` (ADR-001, "Private chat thumbnails") | `u/files/{id}` (`thumbnail_key`, owner-scoped read), then the S3 object `{uid}/thumbnails/{file_id}.{jpg|png|gif|webp}` in `BUCKET_CHAT_FILES`, served with its stored `ContentType`. 404 for another user's id, a row without a key, or a missing object | in |
 | `PUT /v1/integrations/apple-health/sync` | `backend/http/api/integrations.dart:111` `syncAppleHealthData`, from `AppleHealthService.syncHealthDataToBackend` (`services/integrations/apple_health_service.dart:252`). Every chat-page open runs `_syncAppleHealthIfConnected` (`pages/chat/page.dart:155,274-285`), which awaits `IntegrationProvider.ensureLoaded` and syncs seven days when the server says `apple_health` is connected | `routers/integrations.py:351` `sync_apple_health_data` | `u/integrations/apple_health` (`database/users.py:2249` `set_integration`) | in. Conditional: iOS with Apple Health connected. A fresh account has no `apple_health` row, so the startup read reports it disconnected and the sync does not run until the user connects it in settings |
 | `POST /v2/messages/device-tool/{call_id}/result` | `services/device_tools/device_tool_dispatcher.dart:152` `_postResult`, created per streamed reply at `messages.dart:283` | `routers/chat.py:273`, then `utils/device_tools.py:183` | Redis in-flight and result keys with a TTL | in |
 | `POST /v1/users/analytics/chat_message` | `users.dart:485` `setMessageResponseRating`, via `MessageProvider.setMessageNps` (609), from the rating control at `pages/chat/page.dart:1408` | `routers/users.py:840` | `u/messages/{id}` (`rating`) | in |
@@ -429,7 +429,7 @@ is cut and becomes a no-op.
 
 **`POST /v2/files` and `/v2/files/video` upload chain:**
 
-1. **Images and documents.** `utils/other/chat_file.py:249` `FileChatTool.upload`
+1. **Images and documents.** `utils/other/chat_file.py:262` `FileChatTool.upload`
    sends the file to OpenAI Files (`openai.files.create`, line 292). The
    returned id is stored as `openai_file_id`.
 2. **Thumbnails.** `utils/other/storage.py:2343` `upload_multi_chat_files`
@@ -449,12 +449,24 @@ is cut and becomes a no-op.
    (462) call OpenAI chat completions directly and read `files.content`.
 
 After the port the OpenAI Files steps move to S3 plus Bedrock content blocks
-(ADR-001, "Chat files"). Video transcripts stay empty in the MVP. Thumbnails
-become private objects at `{uid}/thumbnails/{file_id}.<ext>`, recorded in a
-new `thumbnail_key` field. The `thumbnail` field holds the stable URL of
-`GET /v2/files/{file_id}/thumbnail`, which the client fetches with its bearer
-token. That URL never expires, so the copies stored in `u/messages` and the
-client's `cachedMessages` keep working (ADR-001, "Private chat thumbnails").
+(ADR-001, "Chat files"). Upload admission narrows to what Converse accepts
+(ADR-001, "Attach contract"). Native documents are stored as is. Other text
+and code files are stored as UTF-8 `txt`. PPTX is stored as extracted
+Markdown. Images Pillow opens that are not JPEG, PNG, GIF or WebP are
+re-encoded to PNG or JPEG. Each document is capped at 4.5 MB (PDFs also at
+100 pages) and each image at 3.75 MB and 8000 px, downscaled to a 2048 px
+longest edge when over. RTF, ODT, PPT, legacy Office template formats and
+non-UTF-8 text get a 400 whose `detail` the client shows in its snackbar. The
+50 MiB part cap stays for video clips. Answer time sends at most 5 documents,
+10 images and 20 MB of inline bytes, newest first, and names the omitted files
+in a text block. Video transcripts stay empty in the MVP. Thumbnails
+become private objects at `{uid}/thumbnails/{file_id}.{jpg|png|gif|webp}`,
+with the suffix and `ContentType` taken from the stored image's format, and
+recorded in a new `thumbnail_key` field. The `thumbnail` field holds the
+stable URL of `GET /v2/files/{file_id}/thumbnail`, which the client fetches
+with its bearer token. That URL never expires, so the copies stored in
+`u/messages` and the client's `cachedMessages` keep working (ADR-001,
+"Private chat thumbnails").
 
 **`POST /v2/messages` dependency chain:**
 
