@@ -90,14 +90,38 @@ GCS buckets become the S3 buckets in ADR-001's bucket table. **Providers** are
 external services: after the port, LLM means Bedrock, STT means Transcribe,
 and Vector means Pinecone, which is cut so calls return empty.
 
-### Shared auth chain (every row)
+### Shared auth chain (authenticated rows)
 
-Every HTTP route resolves the uid through
-`utils/other/endpoints.py::get_current_user_uid` (271), or `_readonly` (257).
-Both call `verify_token` (143). Many add `with_rate_limit` (733), which keeps
-counters in Redis. The WebSocket uses `get_current_user_uid_ws_listen` (462),
-which goes through `_verify_ws_auth` (390), checks the account-deletion marker
-(`account_deletions/{uid}`) and validates BYOK headers.
+This chain applies to every **in** row except the four public routes listed
+below. Each authenticated row uses one of these dependencies from
+`utils/other/endpoints.py`. All of them call `verify_token` (143).
+
+| Dependency | Rows | What it adds after `verify_token` |
+| --- | --- | --- |
+| `get_current_user_uid` (271) | All other authenticated HTTP rows, including `POST /v1/goals/canonical` through `routers/canonical_task_access.py:8` `require_canonical_task_user` | Account-deletion fence (`enforce_account_deletion_http_access`, 107, reads the `account_deletions/{uid}` marker and fails closed with 503), cutover fence, directory-plane resolve, BYOK validation, then client-device and platform recording, locked-content recovery and rollout-cohort load. `/v1/telemetry/fleet` and `/v1/users/client-state` return after BYOK validation and skip the recording steps (300-302) |
+| `get_current_user_uid_no_byok_validation` (334) | `GET /v1/users/me/subscription` | The same fences and recording as above, without BYOK validation, recovery or cohort load |
+| `get_current_user_uid_for_deletion_status` (199) | `GET /v1/users/deletion-status` | Nothing. It skips the deletion fence so a pending-deletion account can read its own status; the handler reads the marker itself |
+| `get_current_user_uid_ws_listen` (462) | `WS /v4/listen` | `_verify_ws_auth` (390), the deletion fence, the cutover fence, the directory-plane resolve and BYOK header validation. No rate limit |
+
+`with_rate_limit` (733) wraps `get_current_user_uid` on the rows whose handler
+names a rate-limit key (for example `memories:create`, `chat:initial`), and
+keeps its counters in Redis. Rows without it carry no per-route rate limit.
+
+**Public routes (no auth dependency).** These four **in** rows take no auth
+dependency, so none of the Cognito, deletion-marker, cutover, BYOK,
+client-device, rollout-cohort or rate-limit dependencies apply to them:
+
+- `GET /v1/health` (`routers/other.py:8`).
+- `GET /v1/announcements/changelogs` (`routers/announcements.py:35`).
+- `GET /v2/firmware/stable` (`routers/firmware.py:408`).
+- `GET /v2/firmware/latest` (`routers/firmware.py:360`). Its only token use
+  is optional: when a fetched release carries a uid allowlist,
+  `_request_audience` (331) calls `_verified_uid` (343), which runs
+  `verify_token` on the `Authorization` header if present. A missing or
+  invalid token yields no uid and the request still succeeds, without the
+  allowlisted releases. The app channel header is read the same way. After
+  the port this call verifies a Cognito token against the pool JWKS, with no
+  fences and no Redis.
 
 | Today | After the port |
 | --- | --- |
@@ -105,9 +129,9 @@ which goes through `_verify_ws_auth` (390), checks the account-deletion marker
 | Client gets the token from `FirebaseAuth.currentUser.getIdToken` (`services/auth_service.dart`) | Client gets it from the hosted UI PKCE exchange at `https://auth.home.sauhsoj.wtf/oauth2/token` and refreshes with the refresh token |
 | Header `Authorization: Bearer <token>` set in `backend/http/shared.dart:263` | Unchanged |
 
-Rate-limit and deletion-marker reads hit Redis (`REDIS_DB_HOST`, now Valkey) and
-`account_deletions`. Those two dependencies apply to every row and are not
-repeated below.
+Rate-limit counters live in Redis (`REDIS_DB_HOST`, now Valkey), and the
+deletion fence reads `account_deletions`. Those dependencies follow from the
+auth dependency above and are not repeated in the rows below.
 
 ## 1. Sign-in and bootstrap
 
