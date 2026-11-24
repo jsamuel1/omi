@@ -42,7 +42,9 @@ each route was classified by reading its callers.
    `app/android/`. It added the client telemetry batch, the transcript and
    Limitless import uploads, the Siri App Intent calls (`OmiNativeAPI`) and one
    external share-service call. The census therefore covers 320 client
-   method+path pairs. Each was matched to its decorator. Seven strings match no decorator: one real call, four URL builders
+   method+path pairs. The port adds one route that exists in neither count,
+   `GET /v2/files/{file_id}/thumbnail` (section 6), and marks it "new in the
+   port". Each was matched to its decorator. Seven strings match no decorator: one real call, four URL builders
    or debug strings, the Siri debug probe and the external share-service call,
    all listed under [No backend route](#no-backend-route) or the appendix.
 4. **Chains.** For each matched handler, the `database.*` modules it imports to
@@ -129,9 +131,11 @@ client-device, rollout-cohort or rate-limit dependencies apply to them:
 | Client gets the token from `FirebaseAuth.currentUser.getIdToken` (`services/auth_service.dart`) | Client gets it from the hosted UI PKCE exchange at `https://auth.home.sauhsoj.wtf/oauth2/token` and refreshes with the refresh token |
 | Header `Authorization: Bearer <token>` set in `backend/http/shared.dart:263` | Unchanged |
 
-Rate-limit counters live in Redis (`REDIS_DB_HOST`, now Valkey), and the
+Rate-limit counters live in Redis (`REDIS_DB_HOST`, now Valkey over TLS with
+`REDIS_DB_TLS=true`, ADR-001 "Valkey: TLS on every client"), and the
 deletion fence reads `account_deletions`. Those dependencies follow from the
-auth dependency above and are not repeated in the rows below.
+auth dependency above and are not repeated in the rows below. Every Redis
+mention in the rows below uses the same endpoint and TLS settings.
 
 ## 1. Sign-in and bootstrap
 
@@ -299,9 +303,17 @@ JSON segment and event messages.
 4. **STT.** `utils/stt/streaming.py` picks a provider from `STT_SERVICE_MODELS`.
    Today that is Modulate then Soniox. After the port it is Amazon Transcribe
    streaming through `TranscribeStreamingSocket`, forwarding finals only, with
-   speakers mapped to `SPEAKER_NN`.
+   speakers mapped to `SPEAKER_NN`. Provider routing reads the fleet health
+   snapshot that `utils/stt/live_health.py` keeps in Valkey (refreshed by the
+   `main.py:242` background task). Demand presence (`utils/stt/demand_presence.py`)
+   and paid-spillover admission (`utils/stt/paid_admission.py`) use Valkey when
+   their features are on. Each builds its own client today; ADR-001 "Valkey:
+   TLS on every client" routes them through the TLS seam.
 5. **Transcript persistence.** `u/conversations/{id}` holds the in-progress
-   conversation and its segments.
+   conversation and its segments. When the session sets a translation
+   language, `TranslationService` (`routers/listen/transcripts.py:184`) caches
+   translations in Valkey (`utils/translation_core/cache.py`) and calls the LLM
+   on a miss.
 6. **Audio archive.** S3 `BUCKET_PRIVATE_CLOUD_SYNC` and `BUCKET_CANONICAL_AUDIO`.
    Private cloud sync defaults on.
 7. **Usage.** `u/hourly_usage` and `u/llm_usage`. The transcription allowance
@@ -399,13 +411,14 @@ is cut and becomes a no-op.
 | --- | --- | --- | --- | --- |
 | `POST /v2/messages?app_id&chat_session_id` (streaming) | `backend/http/api/messages.dart:258` `sendMessageStreamServer`, called from `providers/message_provider.dart:995` | `routers/chat.py:250`, then `utils/chat_turn.py::run_chat_turn` (829), then `utils/retrieval/graph.py::execute_chat_stream` (227) | See the chain below | in |
 | `GET /v2/messages?chat_session_id&offset&limit` | `backend/http/api/chat_sessions.dart:87` `messages`, called from `providers/chat_history_state.dart:80,130,254`. Legacy loader `messages.dart:80` `getMessagesServer`, called from `chat_history_state.dart:270` | `routers/chat.py:371` | `u/messages`, filtered by `chat_session_id` | in |
-| `DELETE /v2/messages?app_id&chat_session_id` | `messages.dart:115` `clearChatServer`, called from `chat_history_state.dart:312` | `routers/chat.py:322` | `u/messages` (batch delete), `u/chat_sessions/{id}` | in |
+| `DELETE /v2/messages?app_id&chat_session_id` | `messages.dart:115` `clearChatServer`, called from `chat_history_state.dart:312` | `routers/chat.py:322` | `u/messages` (batch delete), `u/chat_sessions/{id}`. `FileChatTool.cleanup` (347-350) deletes the session's `u/files` rows and, after the port, their S3 attachment, filmstrip and thumbnail objects | in |
 | `POST /v2/initial-message?app_id` | `messages.dart:322` `getInitialAppMessage`, called from `message_provider.dart:1191` and `pages/chat/page.dart:888` | `routers/chat.py:361`, then `utils/chat.py::initial_message_util` (70) | `u/chat_sessions`, `u/messages`, `users/{uid}` (language). LLM `chat_responses` (`utils/llm/chat.py`) | in |
 | `POST /v2/chat-sessions` | `chat_sessions.dart:70` `create`, called from `chat_history_state.dart:153` | `routers/chat_sessions.py:130` | `u/chat_sessions` | in |
-| `DELETE /v2/chat-sessions/{session_id}` | `chat_sessions.dart:80` `delete`, called from `chat_history_state.dart:110` | `routers/chat_sessions.py:172` | `u/chat_sessions/{id}`, `u/messages` with that session id | in |
+| `DELETE /v2/chat-sessions/{session_id}` | `chat_sessions.dart:80` `delete`, called from `chat_history_state.dart:110` | `routers/chat_sessions.py:172` | `u/chat_sessions/{id}`, `u/messages` with that session id. Today it leaves the session's `u/files` rows and objects behind. After the port it runs `FileChatTool.cleanup` first, as `DELETE /v2/messages` does (ADR-001, "Private chat thumbnails") | in |
 | `POST /v2/chat/generate-title` | `chat_sessions.dart:91` `title`, called from `chat_history_state.dart:172` | `routers/chat_sessions.py:345` | LLM via `get_llm`, writes `u/chat_sessions/{id}` (`title`), `u/llm_usage` | in |
 | `POST /v2/files` | `messages.dart:373`, via `providers/message_provider.dart:575` `uploadFiles` from the chat attachment control | `routers/chat.py:1518` | See the upload chain below | in |
 | `POST /v2/files/video` | `messages.dart:396`, same caller for video attachments | `routers/chat_video.py:57` | See the upload chain below | in |
+| `GET /v2/files/{file_id}/thumbnail` (new in the port) | `pages/chat/widgets/files_handler_widget.dart:112` `_thumbnailImage`, through the new `ChatThumbnailImage` with the `Authorization` header, for every image or video attachment in a rendered message | new handler in `routers/chat.py`, `auth.get_current_user_uid` (ADR-001, "Private chat thumbnails") | `u/files/{id}` (`thumbnail_key`, owner-scoped read), then the S3 object `{uid}/thumbnails/{file_id}.<ext>` in `BUCKET_CHAT_FILES`. 404 for another user's id, a row without a key, or a missing object | in |
 | `PUT /v1/integrations/apple-health/sync` | `backend/http/api/integrations.dart:111` `syncAppleHealthData`, from `AppleHealthService.syncHealthDataToBackend` (`services/integrations/apple_health_service.dart:252`). Every chat-page open runs `_syncAppleHealthIfConnected` (`pages/chat/page.dart:155,274-285`), which awaits `IntegrationProvider.ensureLoaded` and syncs seven days when the server says `apple_health` is connected | `routers/integrations.py:351` `sync_apple_health_data` | `u/integrations/apple_health` (`database/users.py:2249` `set_integration`) | in. Conditional: iOS with Apple Health connected. A fresh account has no `apple_health` row, so the startup read reports it disconnected and the sync does not run until the user connects it in settings |
 | `POST /v2/messages/device-tool/{call_id}/result` | `services/device_tools/device_tool_dispatcher.dart:152` `_postResult`, created per streamed reply at `messages.dart:283` | `routers/chat.py:273`, then `utils/device_tools.py:183` | Redis in-flight and result keys with a TTL | in |
 | `POST /v1/users/analytics/chat_message` | `users.dart:485` `setMessageResponseRating`, via `MessageProvider.setMessageNps` (609), from the rating control at `pages/chat/page.dart:1408` | `routers/users.py:840` | `u/messages/{id}` (`rating`) | in |
@@ -420,8 +433,11 @@ is cut and becomes a no-op.
    sends the file to OpenAI Files (`openai.files.create`, line 292). The
    returned id is stored as `openai_file_id`.
 2. **Thumbnails.** `utils/other/storage.py:2343` `upload_multi_chat_files`
-   writes them to `BUCKET_CHAT_FILES` and returns public URLs.
-3. **Rows.** `database/chat.py:701` `add_multi_files` writes `u/files/{id}`.
+   writes them to `BUCKET_CHAT_FILES` under `{uid}/{thumbnail_name}`, calls
+   `make_public` and returns public URLs.
+3. **Rows.** `database/chat.py:701` `add_multi_files` writes `u/files/{id}`,
+   with the public URL in `thumbnail`. The client renders that URL without
+   auth (`pages/chat/widgets/files_handler_widget.dart:141`).
 4. **Video.** `utils/media/video_upload.py:54` `_transcribe_file` calls
    `ChatMediaStore.transcribe_pcm`, which calls `transcribe_pcm_bytes`
    (`utils/chat.py:257`). A prerecorded STT failure becomes
@@ -433,7 +449,12 @@ is cut and becomes a no-op.
    (462) call OpenAI chat completions directly and read `files.content`.
 
 After the port the OpenAI Files steps move to S3 plus Bedrock content blocks
-(ADR-001, "Chat files"). Video transcripts stay empty in the MVP.
+(ADR-001, "Chat files"). Video transcripts stay empty in the MVP. Thumbnails
+become private objects at `{uid}/thumbnails/{file_id}.<ext>`, recorded in a
+new `thumbnail_key` field. The `thumbnail` field holds the stable URL of
+`GET /v2/files/{file_id}/thumbnail`, which the client fetches with its bearer
+token. That URL never expires, so the copies stored in `u/messages` and the
+client's `cachedMessages` keep working (ADR-001, "Private chat thumbnails").
 
 **`POST /v2/messages` dependency chain:**
 

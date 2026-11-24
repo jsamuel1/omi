@@ -62,7 +62,7 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | Firebase custom-token sign-in (`/v1/auth/*`, Google and Apple) | Cut. Cognito hosted UI with PKCE replaces it | Federating Google and Apple IdPs into the pool now (the pool has COGNITO as its only IdP, and the owner admin-creates users) | `routers/auth.py` stops being called by the client | No |
 | GCS buckets | S3, one bucket per `BUCKET_*` env var, behind a new `S3StorageClient` | One shared bucket with prefixes (breaks per-bucket lifecycle and IAM scoping that the env-var split already implies) | `utils/other/local_storage.py::create_storage_client` (line 348), plus direct `google.cloud.storage` importers listed below | No |
 | Cloud Tasks (durable listen-finalization dispatch) | A new `LISTEN_FINALIZATION_DISPATCH_MODE=in_process` mode: a bounded asyncio dispatcher in the backend container runs the existing worker handler. The durable job rows and the existing startup and periodic reconcilers are the recovery owner (see "Durable finalization") | SQS plus an in-task consumer (extra queue, DLQ and IAM, but the consumer dies with the same task, so it protects nothing the durable rows do not). Inline pusher dispatch (disables every durable recovery path). Step Functions (a workflow engine for a single wake message). Lambda workers (15-minute limit is below the 1500 s dispatch deadline plus retries) | `utils/cloud_tasks.py` `is_listen_finalization_dispatch_enabled` (328), `is_listen_finalization_dispatch_configured` (341), `is_listen_finalization_tasks_configured` (346), `enqueue_listen_finalization_job` (649); `routers/conversation_finalization.py::run_listen_finalization_job` (106) | No |
-| Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py::redis_connection_kwargs` (line 9) gains an `ssl` kwarg | No |
+| Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py` gains `redis_tls_kwargs()` and a `REDIS_DB_TLS` switch, and every production constructor routes through it (see "Valkey: TLS on every client") | No |
 | Soniox / Modulate streaming STT | Amazon Transcribe streaming over a raw SigV4 WebSocket on Python 3.11, as a new `transcribe` provider and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | The closed STT policy seams listed under "STT: seam contract" | No |
 | OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `bedrock` provider), `utils/llm/clients.py::get_llm` (762), `utils/llm/model_config.py` (new `MODEL_QOS` profile) | No |
 | OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings` | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) | No |
@@ -409,6 +409,7 @@ New packages and the image that reaches each one:
 | `langchain-aws` | `utils/llm/providers.py` `bedrock` provider and `BedrockEmbeddings` | add | add. Pusher runs `process_conversation`, which calls `get_llm` for the conversation and memory features |
 | `anthropic[bedrock]` extra | `AsyncAnthropicBedrock` in `utils/retrieval/agentic.py` | change `anthropic>=0.52.0` to `anthropic[bedrock]>=0.52.0` | same change. The bare `anthropic` pin is already in both files |
 | `PyJWT` | `verify_token` in `utils/other/endpoints.py` | already pinned (`requirements.txt:173`) | not added. Pusher does not import `endpoints.py`. The closure probe below confirms it |
+| `certifi` | `database/redis_connection.py::redis_tls_kwargs` CA bundle (see "Valkey: TLS on every client") | already pinned (`requirements.txt:23`) | add `certifi==2026.10.18` |
 
 Every package uses the same pin in both files. `psycopg[binary]==3.2.10`,
 `redis==5.0.8` and `websockets==12.0` are already in both. After editing both
@@ -458,14 +459,230 @@ requirement files, run `backend/scripts/update-python-lock.sh`. It regenerates
 (`utils/other/chat_file.py:249` and 343), and the answer path calls OpenAI chat
 completions directly (`_ask_files_stream` at 397, `_ask_files` at 462).
 
-- Store the bytes in `BUCKET_CHAT_FILES` under `{uid}/{file_id}`. Keep the
-  `openai_file_id` field on `u/files/{id}` and put the S3 key in it, so the
-  rows and `download_owned_chat_file` (115) keep their shape.
+- Store the bytes in `BUCKET_CHAT_FILES` under `{uid}/files/{file_id}`. Keep
+  the `openai_file_id` field on `u/files/{id}` and put the S3 key in it, so the
+  rows and `download_owned_chat_file` (115) keep their shape. A video's
+  filmstrip goes to `{uid}/files/{file_id}.strip.jpg`, and that key replaces
+  the OpenAI id in `video.strip_file_id`.
 - At answer time, read the object and send it to `ChatBedrockConverse` as an
   image or document content block, replacing both `_ask_files*` paths.
-- Cleanup deletes the S3 object instead of the OpenAI file.
-- The thumbnail bucket write (`utils/other/storage.py:2343`) is unchanged apart
-  from the storage client.
+- Thumbnails and deletion follow the private-object contract below.
+
+#### Private chat thumbnails
+
+Today a thumbnail is a public object. `upload_multi_chat_files`
+(`utils/other/storage.py:2343`) uploads `{uid}/{thumbnail_name}`, calls
+`blob.make_public()` (2365) and returns `blob.public_url`. The upload routes
+store that URL in `u/files/{id}.thumbnail` (`routers/chat.py:1567-1577`,
+`utils/media/video_upload.py:39-47`). The chat page renders it with an
+unauthenticated `CachedNetworkImage` (`pages/chat/widgets/files_handler_widget.dart:141`).
+`BUCKET_CHAT_FILES` blocks public access in this port, so that URL would
+return 403. The contract below replaces the public URL with an owner-checked
+backend route.
+
+**Object key.** The backend mints the key from the file id, never from the
+upload's file name: `{uid}/thumbnails/{file_id}.{jpg|png}`. The row stores it
+in a new `thumbnail_key` field on `FileChat` (`models/chat.py:380`). Every key
+in the bucket starts with `{uid}/`, so the owner purge that account deletion
+already runs on `BUCKET_CHAT_FILES` (`storage.py:260`, prefix `{uid}/`) covers
+attachments, filmstrips and thumbnails. Writes carry no ACL and keep the
+existing `owner_storage_write_gate`. `upload_multi_chat_files` becomes
+`upload_chat_thumbnail(uid, file_id, source_path) -> key`, and all four
+callers move together: `routers/chat.py:1568` (`/v2/files`), `:1643` (legacy
+`/v1/files`), `utils/media/video_upload.py:39` (video) and
+`utils/messaging/adapters/media.py:227` (channels). Minting from the id also
+removes a collision: the channel adapter names the thumbnail after the
+attachment's own name, so two photos named `image.jpg` overwrite each other's
+thumbnail today.
+
+**Fetch route.** A new `GET /v2/files/{file_id}/thumbnail` in
+`routers/chat.py` takes `auth.get_current_user_uid`. It reads the row with
+`chat_db.get_chat_files(uid, [file_id])`, so another user's id finds no row.
+It returns 404 when there is no row, no `thumbnail_key`, a key outside
+`{uid}/`, or no object. Otherwise it streams the object with the row's image
+content type, `Cache-Control: private, max-age=86400` and the object's ETag.
+The route needs an entry in `route_policy_manifest.yaml` beside `/v2/files`
+(line 87).
+
+**Projection.** The stored `thumbnail` field holds the stable, unsigned URL
+`{BASE_API_URL}/v2/files/{file_id}/thumbnail`, which never expires. Every
+reader then returns a working value without re-signing anything:
+
+- the upload responses (`routers/chat.py:1586` `client_dump`, `routers/chat_video.py:98`);
+- `GET /v2/messages`, which re-attaches rows from `u/files`
+  (`database/chat.py:437-449`);
+- the human message's embedded `files` copy, which `utils/chat_turn.py:354`
+  sets and `_persist_message` (388) writes into `u/messages`;
+- `GET /v2/desktop/messages` (`routers/chat_sessions.py:216`), which returns
+  that embedded copy as stored;
+- the client's own `cachedMessages` list in SharedPreferences
+  (`backend/preferences.dart:1365-1375`), which `chat_history_state.dart:280`
+  shows when the server list is empty.
+
+The URL must be absolute. `FilesHandlerWidget._isLocalPath` (line 14) treats
+a value starting with `/` as a local file path.
+
+**Client.** `FilesHandlerWidget._thumbnailImage` (112) hands network URLs to a
+small stateful `ChatThumbnailImage`, modelled on `widgets/omi_map_preview.dart:146-178`.
+It resolves `getAuthHeader()` (`backend/http/shared.dart:100`) before the
+first fetch and shows the existing fallback tile while the header resolves.
+It then passes `httpHeaders: {'Authorization': ...}` and
+`cacheKey: 'chat-thumb:<file id>'`, so the image cache survives token
+changes. The header is attached only when the URL's origin equals
+`Env.apiBaseUrl`'s origin, so the bearer token never goes to another host. On
+an error it resolves the header once more (the token may have expired since
+the first build) and retries once, then shows the fallback tile.
+
+**Deletion.** `FileChatTool.cleanup` (`utils/other/chat_file.py:619`) works
+from the raw rows without model validation, as `_openai_file_ids` (94) does
+today. It deletes the attachment key, `video.strip_file_id` and
+`thumbnail_key` with one S3 `DeleteObjects` call, then deletes only the rows
+whose objects are gone. A row whose delete failed stays, so the next clear
+retries it. Today a failed provider delete is logged and its row deleted
+anyway (628-636), which orphans the object. Entry points:
+
+- `DELETE /v2/messages` already calls cleanup (`routers/chat.py:347-350`).
+- `DELETE /v2/chat-sessions/{session_id}` (`routers/chat_sessions.py:172`)
+  does not. It calls `delete_chat_session(cascade_messages=True)`
+  (`database/chat.py:892`), which removes messages but leaves `u/files` rows
+  and their objects. The route must run `FileChatTool(uid, session_id).cleanup()`
+  before the cascade, while the session still lists its `file_ids`.
+- Account deletion is covered by the `{uid}/` prefix purge above.
+
+**Rejected: a fresh presigned URL on every projection.** The URL is persisted
+in three places the backend does not rewrite on read: the embedded message
+copy, the desktop history route that returns it, and the client's
+`cachedMessages`. Each would hold an expired URL once its signature lapsed.
+`CachedNetworkImage` keys on the URL by default, so a new signature per read
+would also defeat the image cache. A URL presigned with the task role's
+temporary credentials stops working when those credentials expire, even if
+the URL's own expiry is later.
+
+**Tests (implementation card).**
+
+- Backend unit: upload writes `thumbnail_key = {uid}/thumbnails/{file_id}.<ext>`
+  and the stable URL, with no ACL or `make_public` call, for all four callers.
+  Two channel photos with the same name get distinct keys.
+- Route: the owner gets 200 with bytes and content type. Another uid's file
+  id, a row without a key, a key outside `{uid}/` and a missing object each get
+  404. A request without a token gets 401.
+- The embedded `files` copy read back from `u/messages` and through
+  `/v2/desktop/messages` fetches successfully. Its URL carries no signature or
+  expiry parameter.
+- Cleanup deletes the attachment, strip and thumbnail objects, then the rows.
+  A failed object delete keeps its row. `DELETE /v2/chat-sessions/{id}` runs
+  cleanup.
+- Against the deployed bucket, an anonymous GET of the object's S3 URL returns
+  403 and the stable route returns 401.
+- Flutter widget test (`test/pages/chat/`): an API-origin URL gets the
+  `Authorization` header and the `chat-thumb:<id>` cache key. A foreign-origin
+  URL gets no header. A 401 re-resolves the header once and then falls back.
+
+### Valkey: TLS on every client
+
+`omi-valkey` has in-transit encryption `required` and an AUTH token.
+ElastiCache allows AUTH only with in-transit encryption on, so a plaintext
+client gets no connection. Production code builds Redis clients in several
+places, and most of them never call `redis_connection_kwargs`. Adding `ssl`
+to that helper alone would leave the bypass constructors failing on every
+call. Each one catches the error and degrades quietly, so the loss would show
+up only as wrong routing, admission or cache behaviour.
+
+**Constructor census.** Every `Redis(` constructor outside `tests/` and
+`testing/` (grep for `Redis(`, `StrictRedis(`, `from_url(`,
+`ConnectionPool(`, `RedisCluster(`, `Sentinel(`, plus the aliased imports
+`aioredis` and `from redis.asyncio import Redis`):
+
+| Constructor | Kind | Reached in the MVP | Without TLS against `omi-valkey` |
+| --- | --- | --- | --- |
+| `database/redis_db.py:26` `r` | sync, through `redis_connection_kwargs` | yes: rate limits, auth fences, signed-URL cache, `/ready` | every call fails. `/ready` reports 503 |
+| `database/redis_db.py:713` `get_async_redis_client` | async, through `redis_connection_kwargs` | yes: listen registry (`routers/listen/registry.py:56`) | listen bookkeeping fails |
+| `database/redis_connection.py:20` `create_bounded_redis_client` | sync, through `redis_connection_kwargs` | yes: 22 call sites, among them `omi_flags`, `action_item_versions`, `rollout_membership_cache`, `fleet_telemetry` and `final_pass_sync` | each caller's fallback |
+| `utils/stt/live_health.py:237` `_redis` | async, direct | yes: `main.py:242` starts `refresh_forever` on every boot; `live_chain.py`, `live_session.py` and `streaming.py` read it | the fleet snapshot never refreshes. `has_fresh_fleet_snapshot` stays false and each task routes on its own local scores |
+| `utils/translation_core/cache.py:244` `_create_redis_client` | sync, direct | yes: every `/v4/listen` session builds a `TranslationService` (`routers/listen/transcripts.py:184`), which uses `get_default_translation_store` (`utils/translation.py:72`) when a translation language is set | `RedisError` is caught (78, 115, 125, 138), so every translation misses the cache and calls the LLM again |
+| `utils/stt/demand_presence.py:91` | async, direct | conditional: demand routing (`routers/listen/demand_routing.py:134`) when the managed chain and session recovery are on | presence reports `unavailable` and keeps visible admission |
+| `utils/stt/paid_admission.py:71` | async, direct | conditional: `STT_PAID_SPILLOVER_BUDGET_ENABLED` (default `false`, line 39) | every promotion is denied as `unavailable` |
+| `utils/llm/vertex_reservation_state.py:75` | async, direct | no: Vertex reservations (desktop proxy, dream capacity, LLM gateway) | n/a in the MVP |
+| `database/proactivity_redis.py:14` `_client` | sync, direct, own endpoint | no: only when `PROACTIVITY_REDIS_HOST` is set. Otherwise it returns `redis_db.r` | n/a in the MVP |
+| `scripts/stt/reset_fleet_provider.py:39`, `scripts/reset_live_stt_cost_gate.py:23` | operator scripts, direct | run by hand against the serving environment | the script cannot connect |
+| `scripts/redis/census.py:56` | operator script, `redis-cli` subprocess | run by hand | needs `--tls` |
+
+**Seam.** `database/redis_connection.py` gains one function and one setting:
+
+- `REDIS_DB_TLS=true` in the task environment. Unset or `false` keeps
+  today's plaintext behaviour, so upstream and local stacks do not change.
+- `redis_tls_kwargs() -> dict` returns `{}` when the switch is off. When it
+  is on, it returns `ssl=True`, `ssl_cert_reqs='required'`,
+  `ssl_check_hostname=True` and `ssl_ca_certs=certifi.where()`. The keys are
+  the same for `redis.Redis` and `redis.asyncio.Redis` in redis 5.0.8.
+- `redis_connection_kwargs` merges `redis_tls_kwargs()`, so `r`,
+  `get_async_redis_client` and `create_bounded_redis_client` pick it up.
+
+The explicit `ssl_check_hostname=True` is required. redis 5.0.8 defaults it
+to `False` in both the sync `SSLConnection` and the async `RedisSSLContext`.
+That default would encrypt the connection without checking that the
+certificate names the endpoint. The endpoint's certificate is issued for
+`*.cache.amazonaws.com`, so `REDIS_DB_HOST` must be the primary endpoint DNS
+name, not an IP. `certifi==2026.10.18` is already pinned in
+`backend/requirements.txt:23` but not in `pusher/requirements.txt`. The pusher
+image copies `database/` (`pusher/Dockerfile:47`) and pins `redis==5.0.8`, so
+`certifi` goes into both files (see "Python dependency closure").
+
+Each direct constructor in the census keeps its own timeouts, retry and
+`decode_responses` settings and adds the shared connection fields:
+
+- `live_health.py:237`, `demand_presence.py:91`, `paid_admission.py:71` and
+  `translation_core/cache.py:244` build from `redis_connection_kwargs()` and
+  then override their timeouts. Their host, port and password reads move into
+  the helper. These three async modules default the host to `localhost` when
+  `REDIS_DB_HOST` is unset, so the helper keeps that fallback for them through
+  a `default_host` argument.
+- `vertex_reservation_state.py:75` adds `**redis_tls_kwargs()`. It stays off
+  the MVP path, but it reads the same `REDIS_DB_*` endpoint, so it must not
+  break when a later card enables it.
+- `proactivity_redis.py:14` is the one intentionally distinct endpoint. It
+  keeps `PROACTIVITY_REDIS_HOST`/`_PORT`/`_PASSWORD` and gains its own
+  `PROACTIVITY_REDIS_TLS` switch, read through the same helper with a prefix
+  argument. It does not inherit `REDIS_DB_TLS`, because its endpoint may be a
+  different service.
+- The two Python scripts add `**redis_tls_kwargs()`. `scripts/redis/census.py`
+  passes `--tls` to `redis-cli` when `REDIS_DB_TLS` is true.
+
+**Guard.** A unit test scans `backend/` outside `tests/` and `testing/` for the
+constructor patterns above and fails on any match outside an allowlist of the
+named call sites, each of which must reference `redis_tls_kwargs` or
+`redis_connection_kwargs`. A new direct constructor therefore fails CI
+instead of silently connecting in plaintext.
+
+**Tests (implementation card).**
+
+- Unit: with `REDIS_DB_TLS=true`, each named constructor (sync `r`, async
+  `get_async_redis_client`, `create_bounded_redis_client`, `live_health`,
+  `demand_presence`, `paid_admission`, `translation_core.cache`,
+  `vertex_reservation_state`) builds a client whose connection pool uses
+  `SSLConnection` (sync) or carries an `ssl_context` with
+  `check_hostname=True` and `verify_mode=CERT_REQUIRED` (async). With the
+  switch unset, each builds a plaintext pool, as today.
+- Unit: `PROACTIVITY_REDIS_HOST` set with `REDIS_DB_TLS=true` and
+  `PROACTIVITY_REDIS_TLS` unset builds a plaintext client to the proactivity
+  host. The two endpoints stay separate.
+- Integration: a local TLS Valkey container (`--tls-port`, a test CA,
+  `--requirepass`) accepts each constructor with the test CA, and refuses a
+  client built with the switch off. A certificate whose name does not match
+  the host is refused.
+- Deploy check: after the first boot, `/ready` returns 200,
+  `live_stt_health.has_fresh_fleet_snapshot()` becomes true within one
+  refresh period, and a repeated translation of the same segment reads the
+  cache.
+
+**Postgres, same rule.** The two Postgres constructors take a full DSN when
+one is set: `database/jobstore/connection.py:46` `dial` (`psycopg.connect(dsn)`)
+and `database/cells/serving.py:22` (`CELLS_PG_DSN`). Only the GCP
+`iam_connector` (65) sets `sslmode`. The DSN built from the RDS secret for the
+adapter, `CELLS_PG_DSN` and `JOBSTORE_PG_*` therefore carries
+`sslmode=verify-full` with `sslrootcert` set to the RDS CA bundle baked into
+the image, and the cluster parameter group sets `rds.force_ssl=1`. A
+plaintext DSN is then refused by the server rather than accepted.
 
 ### Hosting
 
@@ -535,7 +752,7 @@ SSE-S3, public access blocked):
 | `BUCKET_CANONICAL_AUDIO` | `omi-canonical-audio-717494614307-apse2` | canonical audio for finalization |
 | `BUCKET_AUDIO_DERIVED` | `omi-audio-derived-717494614307-apse2` | derived audio artifacts |
 | `BUCKET_SPEECH_PROFILES` | `omi-speech-profiles-717494614307-apse2` | `GET /v3/speech-profile` existence check |
-| `BUCKET_CHAT_FILES` | `omi-chat-files-717494614307-apse2` | chat attachments |
+| `BUCKET_CHAT_FILES` | `omi-chat-files-717494614307-apse2` | chat attachments, filmstrips and thumbnails, all under `{uid}/` and served only through owner-checked routes (see "Private chat thumbnails") |
 | `BUCKET_POSTPROCESSING` | `omi-postprocessing-717494614307-apse2` | reprocess inputs |
 
 Other `BUCKET_*` variables (`BUCKET_BATCH_PIPELINE`, `BUCKET_SCREEN_FRAMES`,
@@ -549,8 +766,42 @@ and logos.
 
 GCS semantics in the S3 client: `if_generation_match=0` becomes
 `If-None-Match: *`. Other generation preconditions become `If-Match` on the
-ETag plus a metadata counter, which is a correctness risk to test. Signed URLs
-become presigned URLs, and resumable uploads become multipart uploads.
+ETag plus a metadata counter, which is a correctness risk to test. Resumable
+uploads become multipart uploads.
+
+**No public object URLs.** Every bucket blocks public access, so no storage
+helper may return an object's bare URL to a client. `blob.public_url`,
+`_blob_public_url` (`storage.py:149`) and `make_public` have no S3 meaning in
+the new client: `public_url` raises and `make_public` is not implemented, so
+a caller that still relies on them fails in tests instead of returning a
+403 URL. On the MVP path the only such caller is the chat thumbnail, replaced
+above. `upload_profile_audio` (309) also returns a public URL, but its route
+`POST /v3/upload-audio` is cut. The others write buckets that stay unset.
+
+**Presigned URLs.** GCS signed URLs become S3 presigned GET URLs. Two
+details differ:
+
+- A presigned URL signed with temporary credentials stops working when those
+  credentials expire, whatever its own expiry says. The ECS task role's
+  credentials rotate, so `_get_signed_url` (`storage.py:2284`) presigns with
+  the task role and caps each URL's lifetime at the minimum of the requested
+  minutes and the remaining credential lifetime minus 5 minutes.
+- `_get_signed_url` caches each URL in Redis for its full lifetime (2296,
+  `redis_db.cache_signed_url`). The cache TTL becomes that capped lifetime
+  minus 60 s, so a cached URL is never handed out in its last minute. The
+  same applies to the screen-frame path (2420-2427), which is cut.
+
+The MVP routes that return presigned URLs are `GET /v1/users/people`,
+`GET /v1/users/people/{person_id}` (speech samples, 60 minutes) and
+`GET /v1/sync/audio/{conversation_id}/urls` (playback, 60 minutes). The
+playback URLs are fetched on each play and not stored. The people list is
+stored in `cachedPeople` (`backend/preferences.dart:1429-1437`), but its
+sample URLs are played only from `pages/settings/person_detail_page.dart:137`,
+which is outside the MVP, and `PeopleProvider.setPeople` (74-92) replaces the
+cache with a fresh fetch on every load. The people settings card that brings
+that page back must refresh before playing, or re-fetch on a 403. A unit test
+presigns with credentials that expire in 10 minutes and asserts the URL and
+its cache TTL both end before then.
 
 **Secrets Manager entries** (prefix `omi/`):
 
@@ -559,8 +810,8 @@ become presigned URLs, and resumable uploads become multipart uploads.
 | `omi/encryption-secret` | `ENCRYPTION_SECRET` (per-uid HKDF key) |
 | `omi/memory-v3-cursor-secret` | `MEMORY_V3_CURSOR_SECRET`, required by `utils/memory/universal_list_cursor.py` |
 | `omi/sync-content-id-secret` | `SYNC_CONTENT_ID_SECRET` |
-| `omi/valkey-auth` | `REDIS_DB_PASSWORD` |
-| RDS-managed master secret for `omi-aurora` | Postgres DSN for the adapter, `CELLS_PG_DSN`, `JOBSTORE_PG_*` |
+| `omi/valkey-auth` | `REDIS_DB_PASSWORD` (the AUTH token, sent as user `default`) |
+| RDS-managed master secret for `omi-aurora` | Postgres DSN for the adapter, `CELLS_PG_DSN`, `JOBSTORE_PG_*`, each with `sslmode=verify-full` |
 | `omi/github-token` (optional) | `GITHUB_TOKEN` for firmware release reads |
 
 ### Durable finalization
@@ -701,6 +952,10 @@ same gap. None is on the MVP path in `in_process` mode:
   `OMI_DISABLED_ROUTES` (see "Cut switches").
 - `DIRECTORY_ROUTING_MODE` unset (off), `FAIR_USE_ENABLED=false`,
   `STT_CAP_DISPATCH_ENFORCEMENT=false`.
+- `REDIS_DB_TLS=true`, `REDIS_DB_HOST` set to the `omi-valkey` primary
+  endpoint DNS name, `REDIS_DB_PORT=6379`. `PROACTIVITY_REDIS_HOST` stays
+  unset, so proactivity shares that client (see "Valkey: TLS on every
+  client").
 - `LISTEN_FINALIZATION_DISPATCH_MODE=in_process` (see "Durable finalization").
   `LISTEN_FINALIZATION_REPLAY_ENABLED` stays unset (true,
   `config/listen_finalization.py:6`). `LISTEN_QUIET_FINALIZATION_ENABLED`
@@ -908,7 +1163,9 @@ and that no "Upload stalled" row is raised after the silence threshold.
   it. Revisit SQS when the backend runs more than one task. Recovery latency
   after a restart is up to 6 minutes, or 26 for a job killed mid-run. Transcribe
   multi-language with diarization. The cross-region `AdminGetUser` call. The
-  `omi://` scheme collision. Fargate memory headroom with two containers.
+  `omi://` scheme collision. Fargate memory headroom with two containers. Any
+  new Redis constructor that bypasses `redis_tls_kwargs` (the guard test
+  catches it) and any new storage helper that returns a bare object URL.
 - **Upstream drift.** New upstream Firestore features reach the fork through
   the adapter. A feature the adapter does not implement fails loudly at the
   transport rather than silently.
