@@ -90,7 +90,9 @@ outside the MVP.
 `documents` table behind the Firestore adapter (ADR-001, "Document store").
 GCS buckets become the S3 buckets in ADR-001's bucket table. **Providers** are
 external services: after the port, LLM means Bedrock, STT means Transcribe,
-and Vector means Pinecone, which is cut so calls return empty.
+and Vector means Pinecone, which is cut: vector reads return empty, and the
+summary-vector writer returns before any embedding call (ADR-001,
+"Embeddings: Titan input bound and the cut index").
 
 ### Shared auth chain (authenticated rows)
 
@@ -181,7 +183,7 @@ task-integration load can also write the Apple Reminders connection (the
 | `GET /v1/flags?surface=mobile` | `backend/http/api/flags.dart:13` `getClientFlags`, called from `utils/analytics/analytics_manager.dart:253` | `routers/omi_flags.py:28` | `omi_flags.resolve_surface`. The project flag store stays unset, so defaults apply | in |
 | `GET /v3/speech-profile` | `backend/http/api/speech_profile.dart:18` `userHasSpeakerProfile`, called from `home_provider.dart:242` | `routers/speech_profile.py:62` | S3 `BUCKET_SPEECH_PROFILES` object `{uid}/speech_profile.wav` exists (`utils/other/storage.py:319`). Returns `false` when the bucket is unset | in |
 | `POST /v1/users/client-state` | `services/sockets/listen_client_state.dart:104` | `routers/users.py:2793` | Redis sorted sets and keys under `demand-processing:v1:` (`utils/conversations/demand_processing.py::observe_surface`). The prefix needs `OMI_ENV_STAGE` set | in |
-| `POST /v1/users/fcm-token` | `notifications.dart:18` `saveFcmTokenServer`, called only from the FCM service | `routers/notifications.py:35` | `u/fcm_tokens` | cut. Route disabled by `OMI_DISABLED_ROUTES`. The client `NotificationService` becomes a no-op, so the call at `app_shell.dart:453` sends nothing |
+| `POST /v1/users/fcm-token` | `notifications.dart:18` `saveFcmTokenServer`, called only from the FCM service | `routers/notifications.py:35` | `u/fcm_tokens` | cut. Route disabled by `OMI_DISABLED_ROUTES`. The client `NotificationService` becomes local-only (ADR-001, "Client: Firebase retirement"), so the call at `app_shell.dart:453` sends nothing |
 
 **First-run onboarding.** The release arm is Pocket
 (`services/experiments/onboarding_variant_gate.dart:109`). Its steps are
@@ -334,8 +336,9 @@ JSON segment and event messages.
    (2585) with the LLM features `conv_structure`, `conv_discard`, `conv_folder`,
    `conv_app_select`, `conv_app_result`, `memories` (three passes),
    `memory_category` and `learnings`. It writes `u/conversations/{id}`
-   (structured fields), `u/memory_items` and `u/memory_operations`. The vector
-   upsert goes to Pinecone, which is cut and returns `False`. Push is cut, so it
+   (structured fields), `u/memory_items` and `u/memory_operations`. Pinecone is
+   cut, so `save_structured_vector` returns before it embeds or extracts
+   metadata, with no Bedrock call. Push is cut, so it
    sends to zero tokens. The pusher sidecar (`HOSTED_PUSHER_API_URL=http://localhost:8081`)
    still receives the session's audio archive, transcript webhooks and speaker
    samples, and runs BYOK finalization.
@@ -505,7 +508,7 @@ caller is one-shot or user-triggered.
 | Area | Routes the app can call | Switch entry | Caller retry policy |
 | --- | --- | --- | --- |
 | Firebase sign-in | `/v1/auth/*` (`POST /v1/auth/token`, `POST /v1/auth/local-dev/custom-token`, `/v1/auth/authorize`) | `OMI_DISABLED_ROUTERS=auth` | None. The app signs in through the Cognito hosted UI and never calls these |
-| Push | `POST /v1/users/fcm-token` | `OMI_DISABLED_ROUTES` `POST /v1/users/fcm-token` | None. `NotificationService` is a no-op, so the call never runs |
+| Push | `POST /v1/users/fcm-token` | `OMI_DISABLED_ROUTES` `POST /v1/users/fcm-token` | None. `NotificationService` is local-only and never reads a push token, so the call never runs |
 | Offline and SD-card sync upload | `POST /v2/sync-capture-manifest`, `POST /v1/sync-local-files`, `POST /v2/sync-local-files`, `POST /v2/sync-local-files/{job_id}/release-hold`, `GET /v2/sync-local-files/{job_id}` | `OMI_DISABLED_ROUTES`, one entry each, as a server backstop. The client switch is `--dart-define=OMI_OFFLINE_AUDIO_UPLOAD=false` | **Automatic and unbounded without a client change.** The transfer coordinator retries a 404 after 5, 10, 20 and 60 s, then on every ten-minute watchdog wake. The fork build sets `OMI_OFFLINE_AUDIO_UPLOAD=false`, which stops every automatic and manual caller (ADR-001, "Client: offline audio upload switch") |
 | Search | `POST /v1/conversations/search` | `OMI_DISABLED_ROUTES` `POST /v1/conversations/search` | One request per query the user types. No retry |
 | Apps and plugins | `/v1/apps*`, `/v2/apps*`, `/v1/app/*`, `/v1/app-*`, app reviews and keys, `/v1/dev/user/*` (the `developer` module, which includes `developer_read`) | `OMI_DISABLED_ROUTERS=apps,developer,developer_key`. The developer key routes (`/v1/dev/keys*`, `api_key_management`) stay mounted and are not reached | One template load per conversation-detail open (`conversation_detail_provider.dart:1065`). No retry; the cache is kept |

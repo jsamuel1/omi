@@ -58,20 +58,20 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | --- | --- | --- | --- | --- |
 | Firestore (document store, transactions, queries, aggregations) | Aurora Serverless v2 PostgreSQL 16, accessed through a Firestore GAPIC-surface adapter over `jsonb` tables | DynamoDB (100-item transaction cap, no interactive read-then-write transactions, 20 GSI cap against 271 indexes, 400 KB items) | `database/_client.py::_build_firestore_client` (line 212) builds `firestore.Client` with an injected `_firestore_api` | No. Ports/cells cover 5 non-MVP domains only |
 | Firebase Auth (ID token verify) | Cognito access token, verified with PyJWT 2.15.1 `PyJWKClient` against the pool JWKS | Cognito ID token (carries no `client_id` claim and is meant for the client, not resource servers) | `utils/other/endpoints.py::verify_token` (143), `_verify_ws_auth` (390), `dependencies.py::get_current_user_id` (64) | No |
-| Firebase Admin user lookup | `cognito-idp:AdminGetUser(Username=sub)` | `ListUsers` with a `sub` filter (extra call, eventually consistent) | `database/auth.py::_firebase_get_user` (line 13, 8 call sites) | No |
+| Firebase Admin user lookup | `cognito-idp:AdminGetUser(Username=sub)` behind a normalizing adapter that returns the Firebase `UserRecord` attribute shape (see "User lookup adapter") | `ListUsers` with a `sub` filter (needs a second permission, returns a list to page and disambiguate) | `database/auth.py::_firebase_get_user` (line 13), plus the raw `auth.get_user` sites listed in "User lookup adapter" | No |
 | Firebase custom-token sign-in (`/v1/auth/*`, Google and Apple) | Cut. Cognito hosted UI with PKCE replaces it | Federating Google and Apple IdPs into the pool now (the pool has COGNITO as its only IdP, and the owner admin-creates users) | `routers/auth.py` stops being called by the client | No |
 | GCS buckets | S3, one bucket per `BUCKET_*` env var, behind a new `S3StorageClient` | One shared bucket with prefixes (breaks per-bucket lifecycle and IAM scoping that the env-var split already implies) | `utils/other/local_storage.py::create_storage_client` (line 348), plus direct `google.cloud.storage` importers listed below | No |
 | Cloud Tasks (durable listen-finalization dispatch) | A new `LISTEN_FINALIZATION_DISPATCH_MODE=in_process` mode: a bounded asyncio dispatcher in the backend container runs the existing worker handler. The durable job rows and the existing startup and periodic reconcilers are the recovery owner (see "Durable finalization") | SQS plus an in-task consumer (extra queue, DLQ and IAM, but the consumer dies with the same task, so it protects nothing the durable rows do not). Inline pusher dispatch (disables every durable recovery path). Step Functions (a workflow engine for a single wake message). Lambda workers (15-minute limit is below the 1500 s dispatch deadline plus retries) | `utils/cloud_tasks.py` `is_listen_finalization_dispatch_enabled` (328), `is_listen_finalization_dispatch_configured` (341), `is_listen_finalization_tasks_configured` (346), `enqueue_listen_finalization_job` (649); `routers/conversation_finalization.py::run_listen_finalization_job` (106) | No |
 | Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py` gains `redis_tls_kwargs()` and a `REDIS_DB_TLS` switch, and every production constructor routes through it (see "Valkey: TLS on every client") | No |
 | Soniox / Modulate streaming STT | Amazon Transcribe streaming over a raw SigV4 WebSocket on Python 3.11, as a new `transcribe` provider and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | The closed STT policy seams listed under "STT: seam contract" | No |
 | OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `bedrock` provider), `utils/llm/clients.py::get_llm` (762), `utils/llm/model_config.py` (new `MODEL_QOS` profile) | No |
-| OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings`. Titan takes at most 8,192 tokens or 50,000 characters per input, and the direct path has no truncation today (`_fit_openai_embedding_text`, `utils/llm/gateway_client.py:726`, runs only on the gateway path). The proxy cuts each input to its first 24,000 characters (8,192 tokens at a conservative 3 characters per token, below the 50,000-character cap) and maps an empty string to one space. On the MVP path the only caller is `save_structured_vector` (`utils/conversations/process_conversation.py:2191`), whose failure the finalizer already absorbs (`utils/conversations/finalizer.py:102-130`) | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) | No |
+| OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings`, behind a Titan input fitter that retries on Titan's own over-token rejection. No embedding call is made while the vector index is cut (see "Embeddings: Titan input bound and the cut index") | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) and `generate_embedding` (1076); `utils/conversations/process_conversation.py::save_structured_vector` (2175) | No |
 | OpenAI Files (chat attachments) | S3 `BUCKET_CHAT_FILES` for the bytes, sent to Bedrock Converse as image and document content blocks, with upload admission narrowed to what Converse accepts (see "Attach contract") | Keeping OpenAI Files (not an AWS service, and a second LLM vendor for one feature) | `utils/other/chat_file.py` `FileChatTool.upload` (262), `upload_video`, `_ask_files_stream` (397), `_ask_files` (462), `download_owned_chat_file` (115); `models/chat.py` `chat_file_is_document` | No |
 | Gemini / ElevenLabs TTS (`/v2/tts/synthesize`) | Cut for MVP. Amazon Polly later | Polly now (the client already falls back to the system voice) | `routers/tts.py` | No |
 | Pinecone (conversation vectors) | Cut for MVP. pgvector on the same Aurora cluster later | OpenSearch Serverless (OCU minimum is a standing cost for one user) | `database/vector_db.py` (`PINECONE_API_KEY`/`PINECONE_INDEX_NAME` at 144-155) | No |
 | Typesense (conversation search) | Cut for MVP. Postgres full-text search later | OpenSearch managed domain (standing instance cost) | `utils/conversations/search.py::search_conversations` (342) | No |
 | Google Maps Static API (`GET /v1/static-map`, `utils/static_map.py:343`, `GOOGLE_MAPS_API_KEY`) | Cut for MVP via `OMI_DISABLED_ROUTERS=static_map`. Amazon Location Service static maps later | Keeping the Google key (a GCP credential in an AWS-only port) | `routers/static_map.py`, `utils/static_map.py::fetch_static_map` | No |
-| Firebase Cloud Messaging push | Cut for MVP via `OMI_DISABLED_ROUTES` (see "Cut switches"). SNS mobile push to APNs later | Amazon Pinpoint (end of support 2026-10-30) | `POST /v1/users/fcm-token` (`routers/notifications.py:35`), `utils/notifications.py` | No |
+| Firebase Cloud Messaging push | Cut for MVP via `OMI_DISABLED_ROUTES` (see "Cut switches"), with the app's notification service made local-only (see "Client: Firebase retirement"). SNS mobile push to APNs later | Amazon Pinpoint (end of support 2026-10-30) | `POST /v1/users/fcm-token` (`routers/notifications.py:35`), `utils/notifications.py`; client `services/notifications/notification_service.dart` | No |
 | GitHub Releases (firmware manifest) | Kept as is. Not GCP | S3 mirror of firmware binaries (duplicates a public source that already has a Redis LKG cache) | `utils/github_releases.py` | n/a |
 | Secret Manager / env files | AWS Secrets Manager, injected as ECS task secrets | SSM Parameter Store SecureString (no managed rotation for the RDS secret) | ECS task definition `secrets` | n/a |
 | GKE / Cloud Run hosting | ECS Fargate behind an ALB | App Runner (no WebSocket support) | Container image from `backend/Dockerfile` and `backend/pusher/Dockerfile` | n/a |
@@ -185,10 +185,103 @@ sites in `routers/transcribe.py`, `routers/mcp.py`, `routers/mcp_sse.py`,
 `routers/public_shared_conversation_chat.py`. `main.py` and `pusher/main.py`
 must skip `firebase_admin.initialize_app`.
 
-**User lookup.** Replace `database/auth.py::_firebase_get_user` with
-`AdminGetUser(Username=sub)`. For sampled users in this pool, `Username` equals
-`sub`. The task role needs `cognito-idp:AdminGetUser` on the pool ARN in
-ap-southeast-4, which is cross-region from the ap-southeast-2 task.
+**User lookup adapter.** `database/auth.py::get_user_from_uid` keeps its
+contract: it returns `None` or a dict with exactly the keys `uid`, `email`,
+`email_verified`, `phone_number`, `display_name`, `photo_url` and `disabled`,
+and it never raises. `get_user_name`, `get_user_full_name`,
+`meeting_context_pack.resolve_owner_identity` and the email and notification
+callers read those keys, so none of them change. Only the SDK boundary changes.
+`_firebase_get_user` becomes `_identity_get_user(uid) -> IdentityRecord | None`,
+which calls `AdminGetUser(UserPoolId=COGNITO_USER_POOL_ID, Username=uid)`
+through a cached `cognito-idp` client in `COGNITO_REGION` (ap-southeast-4).
+
+`AdminGetUser` returns a mapping, not an object. `Username`, `Enabled` and
+`UserCreateDate` are top-level keys, and every user value is a string inside
+`UserAttributes` as `{Name, Value}` pairs. The adapter folds that list into a
+dict once and builds a frozen `IdentityRecord` dataclass:
+
+| `IdentityRecord` field | Source | Conversion and default |
+| --- | --- | --- |
+| `uid` | attribute `sub` | must equal the requested uid (invariant below) |
+| `email` | attribute `email` | string, `None` when absent |
+| `email_verified` | attribute `email_verified` | `True` only for the string `"true"`; absent or anything else is `False` |
+| `phone_number` | attribute `phone_number` | string, `None` when absent |
+| `display_name` | attribute `name` | string, `None` when absent or empty. The pool schema has `name`; 7 of its 9 users set it |
+| `photo_url` | attribute `picture` | string, `None` when absent. Firebase's `photo_url` has no Cognito field of that name; `picture` is the OIDC standard attribute the pool schema carries |
+| `disabled` | top-level `Enabled` | `not Enabled`; a missing key reads as enabled |
+| `creation_timestamp_ms` | top-level `UserCreateDate` | epoch milliseconds, replacing Firebase `user_metadata.creation_timestamp` |
+
+`get_user_from_uid` builds its dict from the first seven fields, so the dict
+keys and value types match what Firebase produced.
+
+**Lookup key invariant.** The adapter passes the uid as `Username` and accepts
+the response only when its `sub` attribute equals the requested uid exactly.
+On a mismatch it logs `identity_lookup outcome=key_mismatch` and returns
+`None`. The invariant holds because the pool's `UsernameAttributes` is
+`["email"]` (CDK `signInAliases: { email: true }` in
+`sauhsoj-account-portal/lib/constructs/cognito.ts:55`, immutable after pool
+creation). In such a pool Cognito generates each username as the user's `sub`,
+and `AdminGetUser` also accepts the email alias as `Username`. On 2026-11-24,
+`list-users` showed `Username == sub` for all 9 users. The check closes the
+alias path: a uid that happens to be an email address would otherwise resolve
+to that user's record. A deploy check runs `describe-user-pool` and fails
+unless `UsernameAttributes == ["email"]` and `AliasAttributes` is empty.
+
+**Errors.** `get_user_from_uid` maps each outcome to its current behaviour:
+
+| `AdminGetUser` outcome | Adapter | `get_user_from_uid` |
+| --- | --- | --- |
+| `UserNotFoundException` | returns `None` | `None`, as Firebase `UserNotFoundError` gives today |
+| `sub` mismatch | returns `None` and logs `key_mismatch` | `None` |
+| `NotAuthorizedException`, `AccessDeniedException`, `ResourceNotFoundException` | raises `IdentityLookupUnavailable` | logs `identity_lookup outcome=unavailable code=<code>` at error level, calls `record_fallback(component='other', reason='other', outcome='degraded')`, returns `None` |
+| `TooManyRequestsException`, timeouts | botocore `standard` retry mode, 3 attempts, 2 s connect and read timeouts, then as above | `None` |
+| empty uid | no call | `None` |
+
+A misconfigured IAM policy or pool id therefore shows up as a fallback
+counter instead of silently turning every owner into "The User".
+
+**Other raw Firebase user reads** move to the same adapter, so no caller reads
+a Firebase `UserRecord`:
+
+| Site | Today | Port |
+| --- | --- | --- |
+| `utils/notifications.py:32` `_get_user` | `auth.get_user`, then `.display_name` and `.email` (559-561) | `_identity_get_user`, same attribute names |
+| `routers/mcp.py:335` `_get_user_contact` | `.display_name`, `.email`, `.phone_number` | `_identity_get_user` |
+| `routers/referrals.py:99` | `user_metadata.creation_timestamp` | `IdentityRecord.creation_timestamp_ms`. The referral routes are deferred but served (census "Partition appendix") |
+| `routers/support.py:32` `resolve_support_target` | `get_user_by_email(email).uid` | `AdminGetUser(Username=email)` returns `sub`, since email is the username attribute. `UserNotFoundException` → 404 |
+| `services/users/account_deletion.py:487`, `:631` | `get_user`, `revoke_refresh_tokens` | Existence check uses `_identity_get_user`. Revocation does nothing in the shared pool: `AdminUserGlobalSignOut` would also sign the user out of every other `sauhsoj.wtf` app. The account-deletion fence (census, "Shared auth chain") already refuses the user's remaining access tokens |
+| `utils/other/endpoints.py:816` `delete_account` | `auth.delete_user` | Deletes no Cognito user. The pool is shared, so omi deletes only its own data |
+| `utils/other/endpoints.py:139` `get_user` | `auth.get_user` | Deleted. No production code calls it; the seven unit tests that assign `endpoints.get_user = MagicMock()` drop that line |
+
+The task role gets `cognito-idp:AdminGetUser` on the pool ARN in
+ap-southeast-4, which is cross-region from the ap-southeast-2 task, and
+nothing else in that pool. `AdminDeleteUser`, `AdminUserGlobalSignOut` and
+`ListUsers` are not granted.
+
+**Rejected: `ListUsers` with a `sub` filter.** It needs `cognito-idp:ListUsers`,
+which lets the task enumerate every user of the shared pool, and it returns a
+list to page and disambiguate. With `Username == sub` enforced, `AdminGetUser`
+is one exact read.
+
+**Tests (auth card).** With a botocore `Stubber` on the `cognito-idp` client:
+
+- A full `AdminGetUser` response yields the seven-key dict with Python types:
+  `bool` for `email_verified` and `disabled`, `str` or `None` for the rest.
+- `email_verified` of `"false"`, `"FALSE"` and absent each read as `False`.
+  `Enabled: False` gives `disabled: True`. Absent `name`, `picture` and
+  `phone_number` give `None`.
+- A response whose `sub` differs from the requested uid returns `None`.
+- `UserNotFoundException` returns `None` with no fallback. `AccessDeniedException`
+  returns `None`, logs `unavailable` and records one fallback.
+- `get_user_name` returns the first word of `name`. With no `name` it falls
+  through to the Firestore profile, as `tests/unit/test_user_name_resolution.py`
+  pins today.
+- The tests that patch `_firebase_get_user` (`test_user_name_resolution.py`,
+  `test_daily_summary_selection_mode.py`, `test_transcript_file_import.py`)
+  and `notifications._get_user` (`test_notification_async_boundaries.py`)
+  patch `_identity_get_user` instead and keep their assertions.
+- Deployed: `GET /v2/messages` after a chat turn shows the owner's `name` in
+  the system prompt's user name (`utils/llm/chat.py:525`).
 
 **Settings that must hold:**
 
@@ -294,19 +387,216 @@ migration and link paths (`auth_provider.dart` lines 30-48, `auth_service.dart`
 | `pages/settings/change_name_widget.dart` | 20 | Firebase `User` field |
 | `utils/auth/sign_in_failure.dart` | 32 | `FirebaseAuthException` mapping. Maps OAuth error codes instead |
 
-**Removal list:** `startup_firebase.dart`, `firebase_options_local.dart`,
-`utils/debugging/crashlytics_manager.dart`; `firebase_core`, `firebase_auth`,
-`firebase_messaging`, `firebase_crashlytics`, `google_sign_in` and
-`sign_in_with_apple` at `pubspec.yaml:40-47`, plus `google_sign_in_ios` (161)
-and the Firebase test interfaces (178, 197); the Google services and
-Crashlytics Gradle plugins at `android/settings.gradle:23-24` and
-`android/app/build.gradle:4-5`; `google-services.json` and
-`GoogleService-Info.plist` with their Xcode project references. Push moves to a
-no-op `NotificationService`.
+### Client: Firebase retirement
 
-**Acceptance check for the auth card:** `grep -r 'package:firebase_' app/lib`
-returns nothing, and sign-in, cold restore, sign-out and account switch work
-against the pool.
+Removing the Firebase packages breaks compilation unless every owner that
+imports them or calls them at startup moves in the same change. The census
+below is every `package:firebase_*`, `google_sign_in` and `sign_in_with_apple`
+import in `app/lib/`, every Firebase symbol use outside those imports, and every
+native and build file that links a Firebase SDK. The `firebase_auth` consumers
+are in the table above. Paths are relative to `app/`.
+
+**Startup (`lib/main.dart`).**
+
+| Lines | Today | Port |
+| --- | --- | --- |
+| 24-27, 53-54, 58 | imports `firebase_auth`, `firebase_core`, `firebase_crashlytics`, `firebase_messaging`, `firebase_options_local.dart`, `firebase_options_prod.dart`, `startup_firebase.dart` | removed |
+| 120 | imports `utils/debugging/crashlytics_manager.dart` | imports `utils/debugging/crash_reporter.dart` |
+| 131-147 | `_firebaseOptionsForFlavor`, `_ensureFirebaseApp` | deleted |
+| 150-154 | `onDeviceOverflowBackground` initializes Firebase, then Opus | keeps the `vm:entry-point`. Its `initialize` calls `AuthSessionGateway.instance.restore()` (reads `flutter_secure_storage`, no network) instead of `_ensureFirebaseApp`, because `on_device_background.dart:35,49` now asks the gateway for the owner |
+| 157-196 | `_firebaseMessagingBackgroundHandler(RemoteMessage)` | deleted. With no FCM there is no background data message. The handlers it called (`ActionItemNotificationHandler`, `MergeNotificationHandler`, `ImportantConversationNotificationHandler`, `ChatAnswerNotificationHandler`) stay, because the foreground paths and tests use them |
+| 214-245 `_reportBootCrash` | journals breadcrumbs, then returns if `Firebase.apps.isEmpty`, else writes to `FirebaseCrashlytics` | journals breadcrumbs, then calls `CrashReporter.instance.recordBoot(kind, error, stack, details: details, fatal: fatal, origin: errorOrigin)`. The `Firebase.apps` guard goes |
+| 270 | `startupStage('firebase_init', _ensureFirebaseApp)` | deleted. The `auth_restore` stage that `CognitoAuthSessionGateway` adds runs in the same position, before `BootCrashHandlers.install` |
+| 272-300 | `BootCrashHandlers.install(initialize: CrashlyticsManager.init, ...)` | `initialize: CrashReporter.init`. Handler order is unchanged, so `test/unit/boot_crash_handlers_test.dart` keeps passing |
+| 303-308 | Firebase Auth emulator stage | deleted |
+| 312 | `NotificationService.instance.initialize` | unchanged call. The instance is the local service below |
+| 314-317 | `FirebaseMessaging.onBackgroundMessage(...)` behind `isFCMSupported` | deleted. `PlatformManager.isFCMSupported` (`utils/platform/platform_manager.dart:99`) is deleted with it; it has no other reader |
+| 408 | `CrashlyticsManager.init` under physical qualification | `CrashReporter.init` |
+| 590-591 | AwesomeNotifications action listener and isolate port | unchanged. Local notification taps keep routing through `NotificationUtil.onActionReceivedMethod` (`services/notifications.dart:42`) to `handleFcmDataTap` |
+
+**Notifications.** `services/notifications/notification_service.dart` imports
+`notification_service_fcm.dart` unconditionally (line 5), and that file imports
+`firebase_messaging` (line 10). Both move:
+
+- New `services/notifications/notification_service_local.dart` with
+  `_LocalNotificationService implements NotificationInterface` and
+  `createNotificationService()`. `notification_service.dart` imports it in
+  place of the FCM file, and its header comment says local-only.
+- These members move from `_FCMNotificationService` unchanged: `initialize`
+  (locale load, channel, `_initializeAwesomeNotifications`, badge reset),
+  `showNotification`, `createNotification`, `clearNotification`,
+  `hasNotificationPermissions` and `getTimeZone`. Every local producer
+  (`sync_health_watchdog.dart:157`, `device_provider.dart:649,731`,
+  `user_provider.dart:484-565`) keeps its behaviour.
+- `requestNotificationPermissions` keeps the AwesomeNotifications permission
+  request and drops the `register()` side effect.
+- `register`, `saveFcmToken`, `saveNotificationToken` and `listenForMessages`
+  return immediately. Their callers (`app_shell.dart:453`, `home/page.dart:160-161`,
+  `auth_provider.dart:345`, `onboarding_provider.dart:233`) are unchanged.
+- `listenForServerMessages` returns a broadcast stream that never emits, so
+  Home's subscription (`home/page.dart:818`) stays valid.
+- `notification_service_fcm.dart` is deleted. `fcm_token_registration.dart`
+  has no Firebase import and stays, because `pages/settings/sign_out.dart:9`
+  and `backend/http/api/notifications.dart:6` import its order key.
+  `test/services/fcm_registration_admission_test.dart` is deleted with the
+  FCM service.
+
+This is what "NotificationService becomes local-only" means in the cut list:
+no push token is read or sent, and local notifications still show.
+
+**Crash and log sink.** `utils/debugging/crashlytics_manager.dart` and
+`utils/logger.dart:4` import `firebase_crashlytics`. The port renames the
+manager to `CrashReporter` in `utils/debugging/crash_reporter.dart` and keeps
+its public members (`init`, `applyBuildProvenanceKeys`, `identifyUser`,
+`logInfo`/`logError`/`logWarn`/`logDebug`/`logVerbose`, `setUserAttribute`,
+`setEnabled`, `reportCrash`, `reportNonFatal`, `getNavigatorObserver`,
+`isSupported`), so its callers change only the type name:
+`platform_manager.dart:14,34`, `analytics_manager.dart:39,119-234`, `main.dart`,
+`test/unit/physical_qualification_test.dart`,
+`test/unit/build_provenance_registration_test.dart` and
+`integration_test/perf/production_shell.dart`.
+
+- The MVP sink is local. `reportCrash`, `reportNonFatal` and `recordBoot`
+  append the error, stack, attributes and build provenance as one JSON line to
+  a new bounded file, `crash_reports.jsonl` in the app documents directory
+  (newest 200 entries; the writer drops the oldest line past that). They also
+  call `DebugLogManager.logError` (`utils/debug_log_manager.dart:166`), which
+  writes only when the user has turned on developer logs (`_append`, 99).
+  `DebugLogManager.listLogFiles` (115), which today matches only
+  `omi_debug_*.log`, also returns `crash_reports.jsonl`, so the
+  developer settings "share logs" action (`pages/settings/developer.dart:86`)
+  attaches it. `log*` calls append
+  to `BootJournal`'s breadcrumbs. `setUserAttribute` and `identifyUser` keep a
+  bounded in-memory map that the next report includes. `isSupported` is
+  `false`.
+- `reportNonFatal` keeps `recordNonFatalFailure`
+  (`utils/debugging/non_fatal_reporter.dart`, no Firebase import), so a sink
+  failure still cannot escape into the global error handler.
+- `logger.dart`: `CrashlyticsTalkerObserver` becomes `CrashReporterTalkerObserver`,
+  which calls `CrashReporter.instance.reportNonFatal`. The Crashlytics import goes.
+- `test/support/crashlytics_recorder.dart` (a Crashlytics method-channel fake
+  used by `capture_provider_test.dart` and `force_processing_placeholder_test.dart`)
+  becomes `crash_reporter_recorder.dart`, a fake `CrashReporter` sink with the
+  same `recordErrors` assertions.
+- Rejected: keeping Crashlytics. It needs `firebase_core` and a Firebase
+  project, which this port removes. A remote crash sink on AWS is follow-up
+  work and plugs in behind `CrashReporter` without touching its callers.
+
+**Environment and qualification.**
+
+- `env/env.dart:10-15,139` (`firebaseAuthEmulatorHost`/`Port`) and `166-172`
+  (`validateFirebaseProject`) are deleted. `env/environment_profile.dart`
+  drops `firebaseProjectId` and `usesFirebaseAuthEmulator`.
+- `env/physical_qualification.dart` is compiled in only with
+  `--dart-define=OMI_PHYSICAL_QUALIFICATION=true`, which the fork does not set,
+  but it must still compile. Lines 137 and 146 drop the emulator host from the
+  private-endpoint check and the HTTP allowlist. Lines 152-154 drop the three
+  native Firebase collection flags, and `ios/Runner/AppDelegate.swift:302-304`
+  stops reporting them (`ios/test/check_userdefaults_plist_values.py:17-19`
+  follows).
+
+**iOS Siri (native).** `ios/Runner/SiriIntegration/SiriSession.swift`,
+`SiriBridge.swift` and `SiriDebugProbe.swift` import `FirebaseAuth` and
+`FirebaseCore`. They authorize each Siri request by reading
+`Auth.auth().currentUser` and fetch a fresh token with `getIDToken`
+(`SiriSession.swift:119-190`), and `SiriNativeAuthFence` listens to Firebase
+auth state (`SiriBridge.swift:262-300`). The census keeps Siri App Intents in
+the MVP, so the native owner check moves onto the session mirror that Dart
+already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
+
+- `refreshSession` takes an `AuthUserSnapshot` and the access token from
+  `tokenChanges()` in place of the Firebase `User` and `IdTokenResult`. It runs
+  on every emission, so the Keychain mirror always holds the newest access
+  token and its `exp`.
+- `requireFirebaseOwner` becomes `requireMirroredOwner(uid)`: the current
+  config's uid must equal `uid` and the mirrored token must exist. It keeps the
+  protected-data branch (`setAuthResolutionPending`).
+- `token(for:)` returns the mirrored token while it has more than 60 s left,
+  the same expiry check it already applies to the fallback path (176-178).
+  Otherwise it throws `Failure.auth`, and the intent asks the user to open Omi.
+  The refresh token is not mirrored to native code.
+- `SiriNativeAuthFence` is deleted. Dart already calls `accountChanged` and
+  `prepareForSignOut` (`siri_integration.dart:492-527`) on sign-out and
+  account switch, and it now drives them from `userChanges()`.
+- `SiriDebugProbe.swift`'s Firebase Auth-emulator probes (the
+  `FirebaseApp.configure` blocks at 301, 966 and 1022) are deleted. They
+  compile only under `OMI_SIRI_PROBE`.
+- Accepted gap: a Siri request more than 60 minutes after the app last
+  refreshed its token fails until the app is opened. Rejected: mirroring the
+  refresh token into the Keychain for native refresh. It widens where a
+  30-day credential lives for a convenience feature.
+
+**Build files and config.**
+
+- `pubspec.yaml`: remove `firebase_core`, `firebase_auth`, `firebase_messaging`,
+  `firebase_crashlytics`, `google_sign_in` and `sign_in_with_apple` (40-47),
+  `google_sign_in_ios` (161), and the dev dependencies
+  `firebase_core_platform_interface` (178) and
+  `firebase_messaging_platform_interface` (197). The
+  `enable-swift-package-manager: false` setting (209-215) stays; its Firebase
+  reason goes, and re-enabling SPM is a separate change.
+- Dart files deleted: `startup_firebase.dart`, `firebase_options_local.dart`,
+  the generated `firebase_options_prod.dart` (gitignored),
+  `utils/debugging/crashlytics_manager.dart`,
+  `services/notifications/notification_service_fcm.dart`,
+  `test/unit/startup_firebase_duplicate_app_test.dart` and
+  `test/unit/firebase_local_options_test.dart`.
+- Android: the Google services and Crashlytics plugins
+  (`android/settings.gradle:23-24`, `android/app/build.gradle:4-5`), the
+  `com.google.firebase` keep and dontwarn rules (`android/app/proguard-rules.pro:50-55`),
+  the `FirebaseInitProvider` removal in
+  `android/app/src/heavyPerf/AndroidManifest.xml:5-6` (nothing to remove once
+  the SDK is gone), and the copied `google-services.json` files.
+- iOS: both "Copy Google Plist file" build phases and every
+  `GoogleService-Info.plist` reference in `ios/Runner.xcodeproj/project.pbxproj`
+  (26, 76, 434, 656, 997, 1031, 1055, 1106), and the plist files under
+  `ios/Config/{Dev,Prod}/`. `ios/ImageNotification/NotificationService.swift`
+  imports `FirebaseMessaging` but no Xcode target builds it; delete the
+  directory.
+- Setup scripts: the Firebase copy steps in `setup.sh:111-146`, `test.sh:42-52`,
+  `setup/scripts/setup.ps1:50-58` and `setup-personal.sh:19-53`, and the
+  `setup/prebuilt/` and `setup/release-firebase/` Firebase files.
+- Tests that import Firebase test interfaces move to an `AuthSessionGateway`
+  fake: `test/services/siri_integration_test.dart`,
+  `test/utils/auth/sign_in_failure_test.dart`,
+  `test/unit/auth_provider_link_session_test.dart`,
+  `test/unit/authenticated_request_401_test.dart`,
+  `test/unit/auth_service_token_result_test.dart`,
+  `test/widgets/home_calendar_filter_test.dart`,
+  `test/widgets/home_announcement_timer_test.dart`,
+  `test/widgets/home_product_mounted_guard_test.dart`,
+  `test/providers/device_provider_fully_charged_alert_test.dart` and
+  `test/providers/device_provider_disconnect_telemetry_test.dart`.
+
+**Compile and startup checks (auth card).**
+
+1. No Firebase reference is left. `grep -rE "package:(firebase_|google_sign_in|sign_in_with_apple)" app/lib app/test app/integration_test`,
+   `grep -rE "import Firebase|FirebaseApp|FIRMessaging" app/ios app/macos` and
+   `grep -rE "google-services|firebase" app/android --include=*.gradle --include=*.pro`
+   each return nothing, and `flutter pub deps --style=list` lists no
+   `firebase_` package.
+2. `flutter analyze` is clean, and `flutter build apk --flavor dev` and
+   `flutter build ios --flavor dev --no-codesign` both succeed with the fork's
+   dart-defines.
+3. A host test runs `_init()` with a fake `AuthSessionGateway`, the
+   AwesomeNotifications platform fake, and no Firebase method-channel mocks.
+   It asserts that `BootJournal` records every stage through
+   `service_manager_init` and records no `firebase_init` stage.
+4. A host test of `_LocalNotificationService`: `initialize` creates the
+   `channel` channel. `createNotification` presents when permission is granted
+   and returns false when it is not. `register` and `saveFcmToken` make no HTTP
+   call (no `POST /v1/users/fcm-token`). `listenForServerMessages` emits
+   nothing.
+5. A host test throws from an `_init` stage and asserts that
+   `CrashReporter`'s recording fake receives one fatal boot report, and that
+   `crash_reports.jsonl` holds it with developer logs off.
+6. On an Android device and an iOS device: cold start reaches Home signed in.
+   A sync-health or fully-charged local notification shows, and tapping it
+   opens its route. A Siri "add a memory" intent succeeds within an hour of
+   opening the app, and asks to open Omi after the mirrored token expires.
+
+**Acceptance check for the auth card:** checks 1-6 pass, and sign-in, cold
+restore, sign-out and account switch work against the pool.
 
 ### STT: Amazon Transcribe streaming
 
@@ -453,6 +743,105 @@ requirement files, run `backend/scripts/update-python-lock.sh`. It regenerates
   (`agentic.py` around line 963) switches to `anthropic.AsyncAnthropicBedrock`.
 - **Gateway.** `OMI_LLM_GATEWAY_FEATURE_MODE` stays unset, so features call the
   model directly.
+
+### Embeddings: Titan input bound and the cut index
+
+**No embedding call while the index is cut.** Pinecone is unconfigured in the
+MVP, so `database/vector_db.index` is `None` and every vector write or query
+is discarded. Several callers still embed first and learn that later:
+`save_structured_vector` (`process_conversation.py:2191`) calls
+`generate_embedding` and, for external-integration conversations, an LLM
+metadata extraction (2204-2210), and only then reaches `upsert_vector2`, which
+returns `False` on `index is None` (`vector_db.py:173`). That runs once per
+completed conversation from the finalizer (`finalizer.py:111`), from
+`process_conversation.py:3107`, and from `smart_merge.py:996`.
+
+The port adds one predicate, `vector_db.vector_index_configured() -> bool`
+(`index is not None`), and every caller that pays for a provider call before
+reaching the index checks it first:
+
+| Caller | Today | Port |
+| --- | --- | --- |
+| `save_structured_vector` (2175) | embeds, extracts metadata, then `upsert_vector2` returns `False` | first check after the existing skip guards: when unconfigured, count `outcome='skipped_index_unconfigured'` and return `True` with no provider call. `True` because nothing is pending, so `apply_settled_enrichment` (2107) does not raise "vector is not ready" and the finalizer does not record a degraded fallback for a deliberate cut |
+| `upsert_vector2` (172) | counts `outcome='error'` on `index is None` | counts `skipped_index_unconfigured`, still returns `False` for any direct caller |
+| `query_vectors` and the other `vector_db` helpers | check `index is None` before embedding (222, 356, 469, 564, 781 and the rest) | unchanged |
+| `utils/mcp_server/handlers/conversations.py:454` `search_conversations_core` | passes `embed_query`, so `resolve_mcp_conversation_search_ids` embeds before `query_vectors` returns empty | passes `embed_query=None` and skips the call when unconfigured, then falls through to its existing keyword search (487-497) |
+| `utils/app_integrations.py:446` `_retrieve_contextual_memories` | embeds the question, then `query_vectors_by_metadata` returns empty | returns `[]` before embedding when unconfigured. Its caller is app proactive notifications, cut with `apps` |
+| `routers/conversations.py:2481`, `utils/retrieval/tool_services/conversations.py:330`, `utils/retrieval/tools/conversation_tools.py:786` | already gate the embed on `index is not None` / `index_available` | unchanged |
+
+`OMI_CONVERSATION_SUMMARY_VECTOR_UPSERTS_TOTAL` (`utils/metrics.py:426`)
+gains the `skipped_index_unconfigured` label value, so a cut index reads as
+skipped rather than as an error rate of 100%.
+
+**Titan input bound.** Titan Text Embeddings V2 accepts at most 8,192 tokens
+or 50,000 characters per input and rejects a longer input with a 400
+`ValidationException` ("Too many input tokens") instead of truncating it
+([model card](https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html)).
+AWS publishes only an average English ratio of about 4.7 characters per
+token. No character count guarantees a token count: code, CJK text and emoji
+can run below one character per token. Titan has no token-counting API (the
+Bedrock `CountTokens` model cards list no Titan embedding model), and the existing fitter
+(`_fit_openai_embedding_text`, `gateway_client.py:726`) counts with OpenAI's
+`cl100k` encoding and runs only on the gateway path, which this port leaves
+off. So the bound is enforced by Titan itself, with a deterministic retry:
+
+1. `_fit_titan_input(text)` removes NUL bytes, maps an empty result to one
+   space (as the OpenAI fitter does), and keeps at most the first 50,000
+   characters, which is Titan's hard character limit.
+2. `_TitanEmbeddings.embed_one(text)` calls `invoke_model` with that input.
+3. On a `ValidationException` whose message contains "too many input tokens"
+   (compared case-insensitively), it halves the input (keeps the first
+   `len // 2` characters, cut back to the last whitespace in the final 10% when
+   there is one) and calls again. It stops after 5 halvings. The last attempt
+   is at most 1,562 characters, which stays under 8,192 tokens even at 4
+   tokens per character (a byte-level tokenizer's worst case, one token per
+   UTF-8 byte). A sixth rejection raises `EmbeddingInputTooLong`, which the
+   callers already treat as a provider failure (the finalizer absorbs it,
+   `finalizer.py:102-130`).
+4. Any other `ValidationException`, and every other error, is raised unchanged
+   on the first attempt. Throttling keeps botocore's `standard` retry mode.
+
+Prefix truncation matches the current gateway fitter's behaviour: the vector
+represents the start of the text. `embed_documents` applies `embed_one` to each
+input in order, so positional alignment with the caller's list holds. Each
+retry logs `embedding_fit outcome=halved chars=<n>` and counts
+`omi_embedding_input_fit_total{outcome}` (`fit`, `halved`, `too_long`), so a
+workload that keeps hitting the retry is visible before Pinecone or pgvector is
+turned on.
+
+**Rejected: a fixed character cap such as 24,000 characters.** A cap that is
+safe for every script would be the 1,562-character floor above, which would
+discard most of a long English summary on every call. A larger cap is a guess
+that fails for dense text.
+**Rejected: a local tokenizer.** AWS does not publish Titan's tokenizer, and
+`cl100k` is a different vocabulary, so it would give a confident wrong count.
+
+**Seam.** `utils/llm/clients.py` builds `_TitanEmbeddings` (a thin
+`BedrockEmbeddings` subclass that overrides `embed_query`, `embed_documents`
+and their async forms) as `_OpenAIEmbeddingsProxy._default` when the new
+`EMBEDDINGS_PROVIDER=bedrock` setting is present. The BYOK branch keeps OpenAI. `langchain-aws`
+re-raises the botocore `ClientError` unchanged in current releases; versions
+before that wrapped it in `ValueError("Error raised by inference endpoint: …")`.
+The retry calls `self.client.invoke_model` directly, so the pinned
+`langchain-aws` version cannot change what it sees.
+
+**Tests (embeddings card).**
+
+- With a botocore `Stubber`: an input rejected once with "Too many input
+  tokens" is retried at half length and returns the second vector. Five
+  rejections then success returns a vector from a ≤ 1,562-character input.
+  Six rejections raise `EmbeddingInputTooLong`. A `ValidationException` with
+  another message, and an `AccessDeniedException`, are raised after one call.
+- 60,000 characters are sent as 50,000. `""` and `"\x00"` are sent as `" "`.
+- `embed_documents([a, b, c])` returns three vectors in order when `b` needed
+  a retry.
+- With `vector_db.index = None`: `save_structured_vector` returns `True`,
+  counts `skipped_index_unconfigured`, and the stubbed embeddings and
+  `retrieve_metadata_from_*` record zero calls. `apply_settled_enrichment`
+  does not raise. `search_conversations_core` makes no embedding call and
+  returns its keyword-search result.
+- Deployed, with Pinecone unset: finalize one conversation and confirm that
+  CloudTrail shows no `InvokeModel` on `amazon.titan-embed-text-v2:0` for it.
 
 ### Chat files: S3 plus Bedrock content blocks
 
@@ -1134,6 +1523,10 @@ same gap. None is on the MVP path in `in_process` mode:
   `OMI_DISABLED_ROUTES` (see "Cut switches").
 - `DIRECTORY_ROUTING_MODE` unset (off), `FAIR_USE_ENABLED=false`,
   `STT_CAP_DISPATCH_ENFORCEMENT=false`.
+- `EMBEDDINGS_PROVIDER=bedrock`, so `utils/llm/clients.py` builds
+  `_TitanEmbeddings` as the default embeddings client.
+- `COGNITO_USER_POOL_ID=ap-southeast-4_jA7oAYYrp` and
+  `COGNITO_REGION=ap-southeast-4` for the user lookup adapter.
 - `REDIS_DB_TLS=true`, `REDIS_DB_HOST` set to the `omi-valkey` primary
   endpoint DNS name, `REDIS_DB_PORT=6379`. `PROACTIVITY_REDIS_HOST` stays
   unset, so proactivity shares that client (see "Valkey: TLS on every
@@ -1194,12 +1587,12 @@ method is still mounted on the same path.
 | Stripe billing | `OMI_DISABLED_ROUTERS=payment,retention_offer,yearly_switch,redeem_code,storefront`, plus `STRIPE_API_KEY` and `STRIPE_*_PRICE_ID` unset | 404 on `/v1/payments/*`, `/v1/stripe/*`, `/v1/payment-methods/*` | `GET /v1/users/me/subscription` stays mounted and returns the seeded `unlimited` plan without calling Stripe. `showSubscriptionUI` is false, so the paywall never opens |
 | Plugins / app store | `OMI_DISABLED_ROUTERS=apps,developer,developer_key` | 404 on `/v1/apps*`, `/v2/apps*` | Conversation detail keeps its cached summary templates (`SummaryTemplatesLoad.failed`) |
 | Typesense search | `OMI_DISABLED_ROUTES=POST /v1/conversations/search`, plus `TYPESENSE_HOST` and `TYPESENSE_API_KEY` unset | 404 | Search returns `ConversationSearchResult.failure` (`app/lib/backend/http/api/conversations.dart:1312`). With the env vars unset, `utils/conversations/typesense_index.py` skips index writes |
-| Pinecone | `PINECONE_API_KEY`, `PINECONE_INDEX_NAME` unset (unconfigured, no route) | Index is `None`. Upserts return `False`, queries return empty | Chat retrieval skips the vector branch (`utils/retrieval/tool_services/conversations.py:330`) |
+| Pinecone | `PINECONE_API_KEY`, `PINECONE_INDEX_NAME` unset (unconfigured, no route) | Index is `None`. Queries return empty. Callers that embed before writing or querying check `vector_index_configured()` first, so no Titan call is made (see "Embeddings: Titan input bound and the cut index") | Chat retrieval skips the vector branch (`utils/retrieval/tool_services/conversations.py:330`) |
 | Twilio phone calls | `OMI_DISABLED_ROUTERS=phone_calls`, plus `TWILIO_*` unset | 404 on `/v1/phone/*` | `/v4/listen?source=phone_call` cannot start, because the client needs `POST /v1/phone/token` first |
 | Telegram / iMessage messaging | `OMI_DISABLED_ROUTERS=messaging`, plus `OMI_TELEGRAM_ENABLED=off` and `OMI_IMESSAGE_ENABLED=off` (the defaults, `utils/messaging/adapters/runtime.py:23,35`) | 404 on `/v1/messaging/*`. `start_adapters` returns `None` | Channel chats page unreachable |
 | Google Calendar and X | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,calendar_meetings,x_connector`, plus `OMI_DISABLED_ROUTES=POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link` | 404 on `/v1/calendar/*` (including `/v1/calendar/meetings*`, a separate module), `/v1/x/*`, and the three conversation calendar-event routes, which live in the retained `conversations` module | Auto-link returns null on any failure. "Link event" asks to connect Google Calendar, which never connects |
 | Task and app integrations (Google Tasks, Todoist, Asana, ClickUp, Gmail) | `OMI_DISABLED_ROUTES=GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url`, plus provider client ids unset | 404 on the OAuth starts. The status reads stay mounted and return no connections | Startup loads succeed with an empty map. Connect buttons fail. Chat integration tools report unconfigured |
-| Push notifications | `OMI_DISABLED_ROUTES=POST /v1/users/fcm-token`. `firebase_messaging` is removed from the app and `NotificationService` becomes a no-op | 404. With no stored tokens, `utils/notifications.py:246` `_send_to_user` sends nothing. `PUT /v1/users/time-zone` on the same router stays mounted | No push |
+| Push notifications | `OMI_DISABLED_ROUTES=POST /v1/users/fcm-token`. `firebase_messaging` is removed from the app and `NotificationService` becomes local-only (see "Client: Firebase retirement") | 404. With no stored tokens, `utils/notifications.py:246` `_send_to_user` sends nothing. `PUT /v1/users/time-zone` on the same router stays mounted | No push. Local notifications still show |
 | Offline and SD-card sync upload | Client: `--dart-define=OMI_OFFLINE_AUDIO_UPLOAD=false` in the fork build (see "Client: offline audio upload switch"). Server backstop: `OMI_DISABLED_ROUTES=POST /v2/sync-capture-manifest;POST /v1/sync-local-files;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id}` | 404, but the client switch means no automatic caller reaches it | Recordings the live session did not cover stay on the phone, listed as not uploaded, with no upload attempts and no stalled-upload alert. Phase 2 path is Transcribe batch from S3 |
 | Voice messages | `OMI_DISABLED_ROUTES=POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream` | 404, and the WebSocket upgrade is refused | `voice_recorder_provider.dart` catches the failure |
 | TTS | `OMI_DISABLED_ROUTERS=tts` | 404 on `/v2/tts/*` | Playback falls back to the system voice |
@@ -1212,7 +1605,7 @@ method is still mounted on the same path.
 | Perplexity web search tool | New `OMI_WEB_SEARCH_TOOL=off`, read where `utils/retrieval/agentic.py:1694` registers the tool. `PERPLEXITY_API_KEY` unset | The tool is not registered, so the model never sees it | Chat answers without web search. Today the tool stays registered and returns an error string |
 | PostHog | `POSTHOG_PRODUCT_CAPTURE_TOKEN`, `POSTHOG_PROJECT_API_KEY`, `POSTHOG_API_KEY` and `POSTHOG_HOST` unset on the backend (`utils/product_telemetry.py:53-81`). The app guards on `Env.posthogApiKey != null` | No events sent | None |
 | LangSmith | `LANGSMITH_TRACING=false`, no `LANGSMITH_API_KEY` (`utils/observability/langsmith.py:26`) | No tracing | None |
-| Crashlytics and Intercom (client) | Removed from the fork's Flutter build. Intercom is also off when `Env.intercomAppId` is unset | n/a | No crash reports or support chat |
+| Crashlytics and Intercom (client) | Crashlytics is removed from the fork's Flutter build and replaced by the local `CrashReporter` sink (see "Client: Firebase retirement"). Intercom is off when `Env.intercomAppId` is unset | n/a | Crash reports stay on the device. No support chat |
 | Custom vocabulary | Not sent to Transcribe | n/a | Per-user keywords ignored |
 
 The exact route spellings above are checked at startup, so the cut card can
