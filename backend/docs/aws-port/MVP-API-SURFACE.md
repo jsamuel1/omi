@@ -2,9 +2,9 @@
 
 Companion to [ADR-001](ADR-001-aws-service-mapping.md). This census places
 every backend route the Flutter app (`app/`) can call into exactly one bucket:
-**in** (the MVP port must serve it), **cut** (a switch in ADR-001 removes it and
-the client tolerates the 404), or **not reached** (no MVP screen or startup path
-calls it). The MVP loop is sign-in and bootstrap, device and firmware, live
+**in** (the MVP port must serve it), **cut** (a switch in ADR-001 removes it,
+and no caller retries it automatically), or **not reached** (no MVP screen or
+startup path calls it). The MVP loop is sign-in and bootstrap, device and firmware, live
 capture, the Home tab, conversations, memories and chat. Rows in sections 1 to 6
 give the client caller, the backend handler, what the handler touches, and the
 bucket.
@@ -12,8 +12,10 @@ bucket.
 Line references are to `origin/main` at `a04153d180`. Client paths are relative
 to `app/lib/`, and backend paths to `backend/`. A route is "in" when the MVP
 port must serve it correctly. It is "cut" when its feature is disabled by a
-switch in ADR-001's [cut switches](ADR-001-aws-service-mapping.md#cut-switches)
-and the client keeps working without it.
+switch in ADR-001's [cut switches](ADR-001-aws-service-mapping.md#cut-switches),
+the client keeps working without it, and no caller retries it on a timer or
+loops on it. A route whose caller would retry indefinitely is not cut until a
+client change stops that caller.
 
 ## How the census was built
 
@@ -57,8 +59,9 @@ each route was classified by reading its callers.
    "Conditional". Only a guard that cannot hold under the fork's switches
    (a compile-time define left off, a server state the cut routes cannot
    create) makes a call **not reached**, and the appendix row names it. It is
-   **cut** when its feature is cut and the client was checked to tolerate a
-   404. Every other pair is **not reached** and is listed, with its reason, in
+   **cut** when its feature is cut, the client was checked to tolerate a 404,
+   and its caller's retry policy was checked (see the retry column of the
+   [cut table](#cut-routes-and-their-switches)). Every other pair is **not reached** and is listed, with its reason, in
    the [partition appendix](#partition-appendix).
 
    The third pass swept every guarded call reachable from startup, Home resume
@@ -188,7 +191,7 @@ foreground resume (`pages/home/page.dart:399-428`).
 | `GET /v1/folders` | `backend/http/api/folders.dart:10`, via `FolderProvider.loadFolders` (35), called from the folder actions at `pages/conversations/conversation_actions.dart:148,232` and `pages/conversation_detail/widgets/conversation_detail_header.dart:289` | `routers/folders.py:31` | `u/folders`, `u/port_mutations` (`database/ports/folders.py`) | in |
 | `POST /v1/folders`, `PATCH /v1/folders/{folder_id}`, `DELETE /v1/folders/{folder_id}` | `folders.dart:29,65,81`, via `FolderProvider` (70, 96, 129), from `pages/conversations/widgets/create_folder_sheet.dart:107,120` and `folder_options_sheet.dart:64` | `routers/folders.py:57`, `:85`, `:108` | `u/folders`, `u/port_mutations`, and the moved `u/conversations` on delete | in |
 | `PATCH /v1/conversations/{conversation_id}/folder`, `POST /v1/folders/{folder_id}/conversations/bulk-move` | `folders.dart:95,108`, via `FolderProvider` (152, 170), from the conversation actions and the merge bar | `routers/folders.py:174`, `:201` | `u/conversations` (`folder_id`), `u/folders` counts | in |
-| `POST /v1/conversations/merge` | `conversations.dart:1492` `mergeConversations`, via `ConversationProvider` (2095), from the Home merge bar | `routers/conversations.py:2664`, then `utils/conversations/merge_conversations_job.py` in a background task | `conversation_finalization_jobs` (`database/conversation_merge_jobs.py:19`), `u/conversations`, `u/deleted_conversations`. With `reprocess`, the section 3 step 9 LLM chain | in |
+| `POST /v1/conversations/merge` | `conversations.dart:1492` `mergeConversations`, via `ConversationProvider` (2095), from the Home merge bar | `routers/conversations.py:2664`, then `utils/conversations/merge_conversations_job.py` in a background task. Merge recovery re-enqueues through `enqueue_listen_finalization_job` (`merge_conversations_job.py:76`), so it needs the `in_process` dispatcher | `conversation_finalization_jobs` (`database/conversation_merge_jobs.py:19`), `u/conversations`, `u/deleted_conversations`. With `reprocess`, the section 3 step 9 LLM chain | in |
 | `POST /v1/attention-items/seen` | `pending_work.dart:85`, via `PendingWorkStore.markSeen` (234), called when the Activity page shows (`pages/activity/activity_page.dart:183`) | `routers/pending_work.py:185` | `u/processing_attention_items` (`database/processing_attention.py`) | in |
 | `POST /v1/attention-items/{item_id}/retry`, `POST /v1/attention-items/retry-all` | `pending_work.dart:61,72`, via `PendingWorkStore.retry` (161) and `retryAll` (202), from `pages/activity/needs_attention_section.dart:136,109` | `routers/pending_work.py:195`, `:126` | `u/processing_attention_items`, `u/processing_retry_claims`, then `POST /v1/conversations/{conversation_id}/reprocess`'s chain | in |
 | `GET /v1/phone/numbers` | `backend/http/api/phone_calls.dart:55`, via `PhoneCallProvider.loadVerifiedNumbers` (177). The provider is lazy (`main.dart:767`) and is first read by `pages/home/widgets/battery_info_widget.dart:306` when the record control is tapped; its constructor calls `loadVerifiedNumbers` (154) | `routers/phone_calls.py:208` | `u/phone_numbers` | cut. `OMI_DISABLED_ROUTERS=phone_calls`. The provider catches the failure and keeps an empty list (`phone_call_provider.dart:184-187`) |
@@ -282,16 +285,23 @@ JSON segment and event messages.
    `routers/listen/conversations.py:330` `schedule_finalization` calls
    `lifecycle_service.request_finalization`, which writes
    `conversation_finalization_jobs` and
-   `conversation_finalization_projection_shards`. It then posts to the pusher
-   sidecar (`HOSTED_PUSHER_API_URL=http://localhost:8081`). Without pusher the
-   job stays queued and the conversation never finalizes.
-9. **Processing on the pusher side.** `utils/conversations/process_conversation.py::process_conversation`
-   (2585) runs the LLM features `conv_structure`, `conv_discard`, `conv_folder`,
+   `conversation_finalization_projection_shards` in one transaction. With
+   `LISTEN_FINALIZATION_DISPATCH_MODE=in_process`, platform-key jobs then go to
+   the backend's in-process dispatcher (`enqueue_listen_finalization_job`,
+   `utils/conversations/lifecycle.py:1262`), not to pusher. If the wake is lost
+   or the live session ends before admission, the startup drain and the 60 s
+   reconcilers replay the durable row (ADR-001, "Durable finalization").
+9. **Processing on the backend worker.** `handle_listen_finalization_wake`,
+   extracted from `routers/conversation_finalization.py:106`, claims the job
+   lease and runs `utils/conversations/process_conversation.py::process_conversation`
+   (2585) with the LLM features `conv_structure`, `conv_discard`, `conv_folder`,
    `conv_app_select`, `conv_app_result`, `memories` (three passes),
    `memory_category` and `learnings`. It writes `u/conversations/{id}`
    (structured fields), `u/memory_items` and `u/memory_operations`. The vector
    upsert goes to Pinecone, which is cut and returns `False`. Push is cut, so it
-   sends to zero tokens.
+   sends to zero tokens. The pusher sidecar (`HOSTED_PUSHER_API_URL=http://localhost:8081`)
+   still receives the session's audio archive, transcript webhooks and speaker
+   samples, and runs BYOK finalization.
 
 ## 4. Conversations
 
@@ -299,7 +309,7 @@ JSON segment and event messages.
 | --- | --- | --- | --- | --- |
 | `GET /v1/conversations?limit&offset&statuses&include_discarded` | `conversations.dart:513` `conversationCollectionUrl`, used by `getConversationsResult` (100), called from `providers/conversation_home_fetch.dart:124` | `routers/conversations.py:963` `get_conversations` | `u/conversations`, ordered by `created_at`, via `conversations_db.get_conversations_without_photos` | in |
 | `GET /v1/conversations/{conversation_id}` | `conversations.dart:440` `getConversationByIdResult`, used by `getConversationById` (496). `ConversationApi.byId` (585) is a second caller, called from `pages/conversation_detail/conversation_detail_provider.dart:87` and `widgets/summary_tab.dart:71` | `routers/conversations.py:1136` | `u/conversations/{id}` | in |
-| `POST /v1/conversations` (process the in-progress conversation now) | `conversations.dart:48` `processInProgressConversationOutcome`, called from `services/capture/capture_controller.dart:4186` | `routers/conversations.py:503` | `lifecycle_service.admit_processing`, then the finalization chain of section 3 steps 8 and 9. Redis cached geolocation | in |
+| `POST /v1/conversations` (process the in-progress conversation now) | `conversations.dart:48` `processInProgressConversationOutcome`, called from `services/capture/capture_controller.dart:4186` | `routers/conversations.py:503`. With durable dispatch enabled it calls `finalize_conversation` (629), the exact-ID outbox path (512-516) | `conversation_finalization_jobs`, then the section 3 step 8 and 9 chain on the backend worker. Redis cached geolocation | in |
 | `POST /v1/conversations/{conversation_id}/reprocess` | `conversations.dart:235` `reProcessConversationServer`, called from `conversation_detail_provider.dart:86` and `pages/activity/needs_attention_section.dart:277` | `routers/conversations.py:759` | `u/conversations/{id}`, then `process_conversation` (LLM features above, `u/memory_items`). Hourly limit in Redis | in |
 | `PATCH /v1/conversations/{conversation_id}/title?title=…` | `conversations.dart:641` `updateConversationTitle`, called from `conversation_detail_provider.dart:1008` | `routers/conversations.py:1194` | `u/conversations/{id}` (`title`) | in |
 | `PATCH /v1/conversations/{conversation_id}/starred?starred=…` | `conversations.dart:780` `setConversationStarred`, called from `pages/conversations/conversation_actions.dart:177` and `pages/conversation_detail/page.dart:837` | `routers/conversations.py:2218` | `u/conversations/{id}` (`starred`), `u/people`, Redis conversation-owner key | in |
@@ -430,28 +440,30 @@ Every route the census marks cut is named here with the exact switch entry that
 removes it. Router switches name a `Mount.module` from `app_roles.py`. Route
 switches name a decorator's method and path exactly. ADR-001's
 [cut switches](ADR-001-aws-service-mapping.md#cut-switches) section defines each
-switch, who enforces it, and the response a client gets.
+switch, who enforces it, and the response a client gets. The retry column
+records what the caller does after the 404. A cut is acceptable only when that
+caller is one-shot or user-triggered.
 
-| Area | Routes the app can call | Switch entry |
-| --- | --- | --- |
-| Firebase sign-in | `/v1/auth/*` (`POST /v1/auth/token`, `POST /v1/auth/local-dev/custom-token`, `/v1/auth/authorize`) | `OMI_DISABLED_ROUTERS=auth` |
-| Push | `POST /v1/users/fcm-token` | `OMI_DISABLED_ROUTES` `POST /v1/users/fcm-token` |
-| Offline and SD-card sync upload | `POST /v2/sync-capture-manifest`, `POST /v1/sync-local-files`, `POST /v2/sync-local-files`, `POST /v2/sync-local-files/{job_id}/release-hold`, `GET /v2/sync-local-files/{job_id}` | `OMI_DISABLED_ROUTES`, one entry each. The WAL keeps audio on 404 |
-| Search | `POST /v1/conversations/search` | `OMI_DISABLED_ROUTES` `POST /v1/conversations/search` |
-| Apps and plugins | `/v1/apps*`, `/v2/apps*`, `/v1/app/*`, `/v1/app-*`, app reviews and keys, `/v1/dev/user/*` (the `developer` module, which includes `developer_read`) | `OMI_DISABLED_ROUTERS=apps,developer,developer_key`. The developer key routes (`/v1/dev/keys*`, `api_key_management`) stay mounted and are not reached |
-| Billing | `/v1/payments/*`, `/v1/stripe/*`, `/v1/payment-methods/*`, `/v1/paypal/*`, `/v1/apps/{app_id}/subscription`, retention offer, yearly switch, redeem code, `/v2/payments/plans` | `OMI_DISABLED_ROUTERS=payment,retention_offer,yearly_switch,redeem_code,storefront`. `GET /v1/users/me/subscription` stays in |
-| Google Calendar and X | `/v1/calendar/google/*`, `/v1/calendar/capture-gaps`, `/v1/calendar/onboarding/*`, `/v1/calendar/meetings*`, `/v1/x/*` | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,calendar_meetings,x_connector` |
-| Calendar links on conversations | `POST /v1/conversations/{conversation_id}/calendar-event`, `DELETE /v1/conversations/{conversation_id}/calendar-event`, `POST /v1/conversations/{conversation_id}/calendar-event/auto-link` | `OMI_DISABLED_ROUTES`, one entry each. These live in the retained `conversations` module |
-| Integration OAuth starts | `GET /v1/task-integrations/{app_key}/oauth-url`, `GET /v1/integrations/{app_key}/oauth-url` | `OMI_DISABLED_ROUTES`, one entry each. The status reads stay mounted |
-| Phone calls | `/v1/phone/*`, including `GET /v1/phone/numbers` | `OMI_DISABLED_ROUTERS=phone_calls`. `/v4/listen?source=phone_call` cannot start without `POST /v1/phone/token` |
-| Messaging channels | `/v1/messaging/*` | `OMI_DISABLED_ROUTERS=messaging` |
-| TTS | `/v2/tts/*`, `/v1/tts/voices`, `/v1/users/voice` | `OMI_DISABLED_ROUTERS=tts` |
-| Voice messages | `POST /v2/voice-messages`, `POST /v2/voice-message/transcribe`, `WS /v2/voice-message/transcribe-stream` | `OMI_DISABLED_ROUTES`, one entry each |
-| Speech-profile enrolment | `GET /v4/speech-profile`, `POST /v3/upload-audio`, `GET /v3/speech-profile/expand`, `DELETE /v3/speech-profile/expand`, `GET /v3/speech-profile/stt-availability` | `OMI_DISABLED_ROUTES`, one entry each. `GET /v3/speech-profile` stays and returns `false` |
-| Review and dream | `/v1/review/*`, `/v2/review/*`, `/v1/entities*`, `GET /v1/conversations/{conversation_id}/entities`, `PUT /v1/users/release-channel`, `/v1/dream/runs` | `OMI_DISABLED_ROUTERS=review,dream_cohort,dream_report`. Already off by `REVIEW_SURFACE_MODE` and `DREAM_AGENT_ENABLED=false`; the switch makes the 404 deterministic |
-| Static map | `GET /v1/static-map` | `OMI_DISABLED_ROUTERS=static_map` |
-| Frame and photo evidence | `GET /v1/conversations/{conversation_id}/photos/{photo_id}/image`, `/v1/frame-requests*` | `OMI_DISABLED_ROUTERS=frame_requests` |
-| Screenshots | `GET /v1/conversations/{conversation_id}/screenshots` and the other `screen_frames` routes | `OMI_DISABLED_ROUTERS=screen_frames` |
+| Area | Routes the app can call | Switch entry | Caller retry policy |
+| --- | --- | --- | --- |
+| Firebase sign-in | `/v1/auth/*` (`POST /v1/auth/token`, `POST /v1/auth/local-dev/custom-token`, `/v1/auth/authorize`) | `OMI_DISABLED_ROUTERS=auth` | None. The app signs in through the Cognito hosted UI and never calls these |
+| Push | `POST /v1/users/fcm-token` | `OMI_DISABLED_ROUTES` `POST /v1/users/fcm-token` | None. `NotificationService` is a no-op, so the call never runs |
+| Offline and SD-card sync upload | `POST /v2/sync-capture-manifest`, `POST /v1/sync-local-files`, `POST /v2/sync-local-files`, `POST /v2/sync-local-files/{job_id}/release-hold`, `GET /v2/sync-local-files/{job_id}` | `OMI_DISABLED_ROUTES`, one entry each, as a server backstop. The client switch is `--dart-define=OMI_OFFLINE_AUDIO_UPLOAD=false` | **Automatic and unbounded without a client change.** The transfer coordinator retries a 404 after 5, 10, 20 and 60 s, then on every ten-minute watchdog wake. The fork build sets `OMI_OFFLINE_AUDIO_UPLOAD=false`, which stops every automatic and manual caller (ADR-001, "Client: offline audio upload switch") |
+| Search | `POST /v1/conversations/search` | `OMI_DISABLED_ROUTES` `POST /v1/conversations/search` | One request per query the user types. No retry |
+| Apps and plugins | `/v1/apps*`, `/v2/apps*`, `/v1/app/*`, `/v1/app-*`, app reviews and keys, `/v1/dev/user/*` (the `developer` module, which includes `developer_read`) | `OMI_DISABLED_ROUTERS=apps,developer,developer_key`. The developer key routes (`/v1/dev/keys*`, `api_key_management`) stay mounted and are not reached | One template load per conversation-detail open (`conversation_detail_provider.dart:1065`). No retry; the cache is kept |
+| Billing | `/v1/payments/*`, `/v1/stripe/*`, `/v1/payment-methods/*`, `/v1/paypal/*`, `/v1/apps/{app_id}/subscription`, retention offer, yearly switch, redeem code, `/v2/payments/plans` | `OMI_DISABLED_ROUTERS=payment,retention_offer,yearly_switch,redeem_code,storefront`. `GET /v1/users/me/subscription` stays in | None. `showSubscriptionUI` is false, so no billing screen opens |
+| Google Calendar and X | `/v1/calendar/google/*`, `/v1/calendar/capture-gaps`, `/v1/calendar/onboarding/*`, `/v1/calendar/meetings*`, `/v1/x/*` | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,calendar_meetings,x_connector` | One request per user action. The capture-gap monitor asks only when `google_calendar_connected` is set, which it never is |
+| Calendar links on conversations | `POST /v1/conversations/{conversation_id}/calendar-event`, `DELETE /v1/conversations/{conversation_id}/calendar-event`, `POST /v1/conversations/{conversation_id}/calendar-event/auto-link` | `OMI_DISABLED_ROUTES`, one entry each. These live in the retained `conversations` module | Auto-link has no caller besides its definition (`conversation_detail_provider.dart:1415`). Link and unlink run once per user action |
+| Integration OAuth starts | `GET /v1/task-integrations/{app_key}/oauth-url`, `GET /v1/integrations/{app_key}/oauth-url` | `OMI_DISABLED_ROUTES`, one entry each. The status reads stay mounted | One request per Connect tap |
+| Phone calls | `/v1/phone/*`, including `GET /v1/phone/numbers` | `OMI_DISABLED_ROUTERS=phone_calls`. `/v4/listen?source=phone_call` cannot start without `POST /v1/phone/token` | One `GET /v1/phone/numbers` when the provider is first constructed (`phone_call_provider.dart:154`). No retry |
+| Messaging channels | `/v1/messaging/*` | `OMI_DISABLED_ROUTERS=messaging` | None. The channel chats page is unreachable |
+| TTS | `/v2/tts/*`, `/v1/tts/voices`, `/v1/users/voice` | `OMI_DISABLED_ROUTERS=tts` | One request per playback, then the system voice |
+| Voice messages | `POST /v2/voice-messages`, `POST /v2/voice-message/transcribe`, `WS /v2/voice-message/transcribe-stream` | `OMI_DISABLED_ROUTES`, one entry each | One request per recording the user sends |
+| Speech-profile enrolment | `GET /v4/speech-profile`, `POST /v3/upload-audio`, `GET /v3/speech-profile/expand`, `DELETE /v3/speech-profile/expand`, `GET /v3/speech-profile/stt-availability` | `OMI_DISABLED_ROUTES`, one entry each. `GET /v3/speech-profile` stays and returns `false` | One preflight per opening of the voice-profile flow |
+| Review and dream | `/v1/review/*`, `/v2/review/*`, `/v1/entities*`, `GET /v1/conversations/{conversation_id}/entities`, `PUT /v1/users/release-channel`, `/v1/dream/runs` | `OMI_DISABLED_ROUTERS=review,dream_cohort,dream_report`. Already off by `REVIEW_SURFACE_MODE` and `DREAM_AGENT_ENABLED=false`; the switch makes the 404 deterministic | `ReviewProvider.load` runs on conversation-list refresh (`conversations_page.dart:896`) and Review page open (`review_page.dart:33`); after a 404 the card hides. `reportReleaseChannel` runs once per session. No timer |
+| Static map | `GET /v1/static-map` | `OMI_DISABLED_ROUTERS=static_map` | One image request per map render. No timer |
+| Frame and photo evidence | `GET /v1/conversations/{conversation_id}/photos/{photo_id}/image`, `/v1/frame-requests*` | `OMI_DISABLED_ROUTERS=frame_requests` | One image request per photo render. The cache returns null |
+| Screenshots | `GET /v1/conversations/{conversation_id}/screenshots` and the other `screen_frames` routes | `OMI_DISABLED_ROUTERS=screen_frames` | One request per detail open. The refresh timer re-arms only after a success |
 
 **Verification.** ADR-001's cut-switch verification test boots the app with the
 fork's switch values and asserts, for every route in this table, that the route
@@ -494,7 +506,7 @@ reason). Grouped by client file.
 | `backend/http/api/conversation_tasks.dart` | `POST /v1/conversations/with-tasks/page` | not reached. Only the conversations-with-tasks page calls it, opened from search at `global_search.dart:692` |
 | `backend/http/api/conversations.dart` | `GET /v1/conversations/{conversation_id}/transcripts`, `GET /v1/conversations/hidden-noise-counts` | not reached. No caller outside the API file |
 | `backend/http/api/conversations.dart` | `POST /v1/conversations/{conversation_id}/test-prompt` | not reached. Shown only in the developer tools group (`pages/conversation_detail/page.dart:934,1059`) |
-| `backend/http/api/conversations.dart` | `POST /v2/sync-capture-manifest`, `GET /v2/sync-local-files/{job_id}` | cut. `OMI_DISABLED_ROUTES` entries |
+| `backend/http/api/conversations.dart` | `POST /v2/sync-capture-manifest`, `POST /v2/sync-local-files`, `GET /v2/sync-local-files/{job_id}` (`conversations.dart:908,1109,1229`) | cut. `OMI_DISABLED_ROUTES` entries. The fork build's `OMI_OFFLINE_AUDIO_UPLOAD=false` stops the upload coordinator and every manual sync control, so no client code calls them (ADR-001, "Client: offline audio upload switch") |
 | `backend/http/api/audio.dart` | `GET /v1/sync/audio/{conversation_id}/{audio_file_id}` | not reached. `getAudioStreamUrl` has no caller outside the API file |
 | `backend/http/api/daily_summary_creation.dart`, `users.dart` (daily summaries), `pages/conversations/widgets/daily_summaries_list.dart` | `POST /v1/users/daily-summaries`, `GET /v1/users/daily-summaries/{summary_id}`, `PATCH /v1/users/daily-summaries/{summary_id}/visibility`, `DELETE /v1/users/daily-summaries/{summary_id}`, `POST /v1/users/daily-summaries/{summary_id}/regenerate`, `GET`/`PATCH /v1/users/daily-summary-settings` | not reached. Home's recap row is a developer opt-in (`conversations_page.dart:921-929`), and the recap detail and settings pages are outside the MVP. The Activity page lists recaps but a fresh account has none |
 | `backend/http/api/dev_api.dart`, `backend/http/api/mcp_api.dart` | `/v1/dev/keys*`, `/v1/mcp/keys*`, `GET /v1/mcp`, `GET`/`DELETE /v1/mcp/oauth/grants*` | not reached. Developer settings only |

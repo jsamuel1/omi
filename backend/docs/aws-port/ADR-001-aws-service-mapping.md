@@ -61,7 +61,7 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | Firebase Admin user lookup | `cognito-idp:AdminGetUser(Username=sub)` | `ListUsers` with a `sub` filter (extra call, eventually consistent) | `database/auth.py::_firebase_get_user` (line 13, 8 call sites) | No |
 | Firebase custom-token sign-in (`/v1/auth/*`, Google and Apple) | Cut. Cognito hosted UI with PKCE replaces it | Federating Google and Apple IdPs into the pool now (the pool has COGNITO as its only IdP, and the owner admin-creates users) | `routers/auth.py` stops being called by the client | No |
 | GCS buckets | S3, one bucket per `BUCKET_*` env var, behind a new `S3StorageClient` | One shared bucket with prefixes (breaks per-bucket lifecycle and IAM scoping that the env-var split already implies) | `utils/other/local_storage.py::create_storage_client` (line 348), plus direct `google.cloud.storage` importers listed below | No |
-| Cloud Tasks (finalization dispatch) | Inline dispatch to a pusher sidecar for MVP. SQS is the post-MVP queue | Step Functions (heavier than a FIFO work queue for one user) | `utils/pusher.py` (`HOSTED_PUSHER_API_URL`), `routers/listen/conversations.py::schedule_finalization` (330) | No |
+| Cloud Tasks (durable listen-finalization dispatch) | A new `LISTEN_FINALIZATION_DISPATCH_MODE=in_process` mode: a bounded asyncio dispatcher in the backend container runs the existing worker handler. The durable job rows and the existing startup and periodic reconcilers are the recovery owner (see "Durable finalization") | SQS plus an in-task consumer (extra queue, DLQ and IAM, but the consumer dies with the same task, so it protects nothing the durable rows do not). Inline pusher dispatch (disables every durable recovery path). Step Functions (a workflow engine for a single wake message). Lambda workers (15-minute limit is below the 1500 s dispatch deadline plus retries) | `utils/cloud_tasks.py` `is_listen_finalization_dispatch_enabled` (328), `is_listen_finalization_dispatch_configured` (341), `is_listen_finalization_tasks_configured` (346), `enqueue_listen_finalization_job` (649); `routers/conversation_finalization.py::run_listen_finalization_job` (106) | No |
 | Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py::redis_connection_kwargs` (line 9) gains an `ssl` kwarg | No |
 | Soniox / Modulate streaming STT | Amazon Transcribe streaming over a raw SigV4 WebSocket on Python 3.11, as a new `transcribe` provider and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | The closed STT policy seams listed under "STT: seam contract" | No |
 | OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `bedrock` provider), `utils/llm/clients.py::get_llm` (762), `utils/llm/model_config.py` (new `MODEL_QOS` profile) | No |
@@ -101,10 +101,12 @@ The decision rests on how the code uses Firestore, not on the data volume.
   A minimum capacity of 0 ACU enables auto-pause (`SecondsUntilAutoPause`
   300-86400). Resume takes about 15 s, or 30 s or more after more than 24 h
   paused ([auto-pause docs](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2-auto-pause.html)).
-  The backend runs background reconcile loops (`main.py` imports
-  `reconcile_listen_finalization_jobs` and three siblings) that may keep the
-  cluster from pausing. Minimum capacity is therefore a tuning lever: start at
-  0.5 ACU and measure. Pricing:
+  The backend runs the durable-finalization reconcilers every 60 s
+  (`main.py:278`, `_periodic_listen_finalization_reconcile`, 60 s with quiet
+  finalization on), and the port depends on them for recovery (see "Durable
+  finalization"). Each tick reads Aurora, so the cluster never reaches the
+  300 s minimum auto-pause idle period. Auto-pause is therefore not a cost
+  lever for this design: run at a 0.5 ACU minimum and measure. Pricing:
   [Aurora pricing](https://aws.amazon.com/rds/aurora/pricing/). DynamoDB
   on-demand would be cheaper at idle, which does not outweigh the rewrite.
 
@@ -491,14 +493,20 @@ Cognito and GitHub without NAT. Inbound access is limited by `omi-task-sg`.
 EC2 was rejected because it adds patching for no saving at this size. Lambda
 cannot hold the `/v4/listen` WebSocket.
 
-**Pusher sidecar.** `schedule_finalization`
-(`routers/listen/conversations.py:330`) logs "Pusher unavailable; finalization
-remains queued" and returns `False` when no pusher client exists and
-listen-finalization dispatch is off. Conversations would never finalize. The
-pusher image (`backend/pusher/Dockerfile`) therefore runs in the same task,
-with `HOSTED_PUSHER_API_URL=http://localhost:8081`. It stays off the ALB,
+**Pusher sidecar.** Platform-key conversation finalization does not run on
+pusher in this port. It runs on the backend container's in-process worker (see
+"Durable finalization"), because with durable dispatch enabled
+`request_finalization` routes platform-key jobs to the worker and skips the
+pusher handoff (`utils/conversations/lifecycle.py:1246-1262`). Pusher still
+runs, as a sidecar in the same task, for the work `/v4/listen` streams to it
+over `/v1/trigger/listen` (`routers/pusher.py:2040`): the private-cloud-sync
+audio archive (`upload_audio_chunks_batch`), transcript webhooks, speaker
+samples, and BYOK finalization. The backend reaches it at
+`HOSTED_PUSHER_API_URL=http://localhost:8081`. Pusher stays off the ALB,
 because `/v1/trigger/listen` takes a `uid` query parameter without
-authenticating it.
+authenticating it. A pusher restart can drop live archive frames for the
+sessions open at that moment. It cannot strand a conversation, because no
+finalization job depends on pusher.
 
 Fargate tasks use `awsvpc` networking, so both containers share one network
 namespace and one port space. Both images hard-code `--port 8080` in `CMD`
@@ -555,6 +563,121 @@ become presigned URLs, and resumable uploads become multipart uploads.
 | RDS-managed master secret for `omi-aurora` | Postgres DSN for the adapter, `CELLS_PG_DSN`, `JOBSTORE_PG_*` |
 | `omi/github-token` (optional) | `GITHUB_TOKEN` for firmware release reads |
 
+### Durable finalization
+
+Upstream has two listen-finalization modes (`backend/docs/listen_finalization_jobs.mdx`,
+"Configuration and rollout"). `inline` hands each job to pusher over the live
+WebSocket. `cloud_tasks` wakes a dedicated worker through a Cloud Tasks queue.
+In both modes the job row in `conversation_finalization_jobs`, with its
+`dispatch_generation` and lease epoch, is the source of truth, and the queue
+only carries the opaque wake `{job_id, dispatch_generation}`. Every durable
+recovery path is gated on the `cloud_tasks` mode or on a configured Cloud Tasks
+binding, so `inline` silently disables all of them:
+
+| Recovery path | Gate | Effect in `inline` |
+| --- | --- | --- |
+| Stale `in_progress` admission, `reconcile_stale_in_progress_conversations` | `services/conversation_finalization.py:124`, mode check | Returns `mode: off`. A content-bearing conversation whose live session died is never finalized |
+| Queued and leased job replay, `reconcile_listen_finalization_jobs` | `services/conversation_finalization.py:231-232`, `replay_enabled()` and `is_listen_finalization_tasks_configured()` | Returns before scanning. A queued job whose pusher handoff was lost stays queued |
+| Self-heal admission | `services/conversation_selfheal.py:598-607`, `request_finalization(..., require_cloud_tasks=True)` | Raises `FinalizationDispatchUnavailable`, logged as `dispatch_unavailable` |
+| Quiet finalization checks | `utils/conversations/quiet_finalization.py:34` (wake) and `:100` (run) | No wake is sent, and a replayed check raises |
+| Merge recovery, `merge_conversations_job.reconcile` | `utils/conversations/merge_conversations_job.py:76` calls `enqueue_listen_finalization_job` directly | Raises, because the binding is empty |
+| `POST /v1/conversations` | `routers/conversations.py:512` | Takes the legacy synchronous path instead of the exact-ID outbox (`finalize_conversation`, `routers/conversations.py:629`) |
+
+The port therefore keeps the durable design and replaces only the transport.
+
+**Decision.** Add a third mode, `LISTEN_FINALIZATION_DISPATCH_MODE=in_process`.
+The backend container runs one bounded asyncio dispatcher. It replaces the
+Cloud Tasks hop and keeps every other part of the durable path.
+
+| Seam | Change |
+| --- | --- |
+| `utils/cloud_tasks.py:328` `is_listen_finalization_dispatch_enabled` | True for `cloud_tasks` or `in_process` |
+| `:341` `is_listen_finalization_dispatch_configured`, `:346` `is_listen_finalization_tasks_configured` | In `in_process`, true with no GCP binding. The `cloud_tasks` regex checks are unchanged |
+| `:649` `enqueue_listen_finalization_job` | In `in_process`, hands `(job_id, dispatch_generation, schedule_at)` to the dispatcher instead of `enqueue_named_task`. This is the only enqueue seam: live admission (`lifecycle.py:1262`), the reconcilers (`services/conversation_finalization.py:414`), quiet checks (`quiet_finalization.py:37`) and merge recovery (`merge_conversations_job.py:76`) all call it, so none of them changes |
+| `routers/conversation_finalization.py:106` `run_listen_finalization_job` | Extract the body after payload parsing into `handle_listen_finalization_wake(job_id, dispatch_generation, retry_count)`, returning the same status and body. The HTTP route keeps calling it. Its OIDC dependency answers 403 when `LISTEN_FINALIZATION_TASKS_HANDLER_URL` is unset (`verify_configured_cloud_tasks_oidc`, `utils/cloud_tasks.py:669`), so the route stays closed on the ALB |
+| New `utils/conversations/finalization_dispatcher.py` | A delay heap and an `asyncio.Semaphore(2)`, started from the `main.py` lifespan beside `_periodic_listen_finalization_reconcile` (278). A wake with `schedule_at` waits until that instant. A 2xx result drops the wake. A 409 or 500 re-arms the same wake after 30 s, 60 s, 120 s, then 300 s, until `LISTEN_FINALIZATION_TASKS_MAX_ATTEMPTS` (default 5) is reached. After that the wake is dropped, and the reconcilers own the job. The retry count passed to the handler is the in-memory attempt number. The handler already takes `max(task_retry_count, failed_attempts)` from the job row (`routers/conversation_finalization.py:82`), so a restart that resets the counter does not reset the budget |
+| Shutdown | The dispatcher stops taking wakes when lifespan shutdown starts. Wakes still in its heap are lost on purpose, because the reconcilers replay them |
+| `scripts/runtime_env_durable_dispatch_contracts.py` | Unchanged. It enforces `cloud_tasks` for `prod` only, and the fork runs `OMI_ENV_STAGE=dev` |
+
+Duplicate wakes are safe for the same reasons they are under Cloud Tasks. The
+handler checks `dispatch_generation`, takes the per-job Redis run lock
+(`try_acquire_job_run_lock`), and claims a lease epoch in a transaction, so a
+wake from the dispatcher and a replay from the reconciler cannot both run one
+job.
+
+**Loss bounds.** Producers, the dispatcher and the reconcilers are all in the
+backend container. No wake producer runs in pusher.
+
+| Failure | Recovery | Bound |
+| --- | --- | --- |
+| Wake lost before it runs (container restart, dispatcher crash, attempts exhausted) | The startup drain (`main.py:386`, `_drain_listen_finalization_jobs`) or the periodic reconciler re-enqueues a queued job once it is older than `LISTEN_FINALIZATION_RECONCILE_STALE_SECONDS` (default 300, `database/conversation_finalization_jobs.py:85`) | About 6 minutes: 300 s staleness plus one 60 s tick |
+| Container killed while a job holds its lease | The lease expires after `DEFAULT_LEASE_SECONDS=1500` (`database/conversation_finalization_jobs.py:84`), then the reconciler reclaims it with a new epoch | About 26 minutes. This is the same bound Cloud Tasks gives, because its dispatch deadline is also 1500 s |
+| Live session lost before admission (backend restart, socket drop) | `reconcile_stale_in_progress_conversations` admits the content-bearing `in_progress` row with `SERVER_RECOVERY` through the 5-minute content-due scan, and its legacy cursor handles markerless rows after `STALE_AFTER` (2 h) | 5 to 6 minutes for indexed rows. 2 hours for markerless rows |
+| Quiet check wake lost | `_reconcile_quiet_candidate` (`services/conversation_finalization.py:173`) replays due checks from their indexed due instant | One reconcile tick after the due instant |
+| Repeated handler failure | The existing budget: one delayed requeue, then the job row records `dead_letter` | Five attempts, as upstream |
+| Aurora data loss | None. The job rows are the record | Out of scope. Aurora backups apply |
+
+No admitted job is lost while Aurora keeps its rows. The cost is latency after
+a restart, and the bounds above are the accepted latency.
+
+**Rejected: SQS.** A standard queue plus a DLQ and a long-poll consumer in the
+backend container would replace Cloud Tasks one to one. It needs a
+15-minute `DelaySeconds` cap with self-deferral for later quiet checks, an
+1800 s visibility timeout above the 1500 s deadline, and IAM for five SQS
+actions. With one task, the consumer runs in the same container as the
+producers and the reconcilers. When that container dies, the queued messages
+wait for the same restarted container that the reconcilers would replay from.
+SQS therefore adds a service, a DLQ to inspect and an IAM surface without
+shortening any bound above. Revisit when the backend runs more than one task,
+or finalization moves to its own service. Then the extracted handler is the
+SQS consumer's body, and only `enqueue_listen_finalization_job` changes again.
+
+**Other paths that call Cloud Tasks directly.** These were checked for the
+same gap. None is on the MVP path in `in_process` mode:
+
+- Demand processing: `postpone` and `_wake` call `enqueue_named_task`
+  (`utils/conversations/demand_processing.py:92`, `:276`). It stays off
+  (`DEMAND_PROCESSING_ENABLED` defaults false, `config/demand_processing.py:12`),
+  so `schedule` returns `False` before any wake (`demand_processing.py:116`).
+- Enrichment outbox (`utils/enrichment/outbox.py:288`, `:334`): it owns no
+  runtime outside `prod` or the Firestore emulator, so it is inert in `dev`.
+- Final-pass retry (`utils/conversations/final_pass_retry.py:44`),
+  provider-STT wakes (`utils/provider_stt_tasks.py:22`) and quarantine recovery
+  (`utils/batch_pipeline/quarantine_recovery.py:715`): batch-pipeline paths
+  reached only from the cut sync uploads.
+- Account deletion and conversation batch purge: both run in process when
+  their Cloud Tasks binding is unset. Account deletion requires Cloud Tasks
+  only for `prod` (`validate_account_deletion_dispatch_configuration`,
+  `utils/cloud_tasks.py:200`), and the batch purge stays inline without a
+  binding (`utils/conversations/deletion_batch_purge.py:54`).
+- Cloud Scheduler jobs (`backend/deploy/scheduler/jobs.yaml`): none is on the
+  MVP path.
+
+**Tests for the implementation card:**
+
+1. Unit tests beside `tests/unit/test_listen_finalization_cloud_tasks.py`: with
+   `in_process` and no GCP binding, the three predicates are true,
+   `request_finalization(require_cloud_tasks=True)` admits, and
+   `enqueue_listen_finalization_job` reaches the dispatcher, not
+   `enqueue_named_task`.
+2. Dispatcher tests: `schedule_at` is honoured; 2xx drops the wake; 409 and 500
+   re-arm with the stated backoff; wakes stop at the attempt cap; a duplicate
+   wake for a leased job gets 409 and does not run the job twice.
+3. Reconciler tests extending `test_conversation_finalization_jobs*.py`,
+   `test_conversation_quiet_finalization.py` and `test_selfheal_*.py`:
+   `reconcile_stale_in_progress_conversations` no longer returns `mode: off`,
+   and `reconcile_listen_finalization_jobs` scans and re-enqueues a stale
+   queued job in `in_process`.
+4. Restart tests in `testing/listen_pusher_stack/`. `Stack` accepts only
+   `inline` and `cloud_tasks` today (`run.py:165`), so add `in_process`. Then:
+   (a) admit a conversation, call `restart_backend()` (`run.py:444`) before the
+   wake runs, and assert the startup drain completes the job; (b) call
+   `restart_pusher()` (`run.py:425`) during a session and assert finalization
+   still completes; (c) end a live session without admission, restart the
+   backend, and assert the stale `in_progress` scan finalizes it. The fixture
+   shortens `LISTEN_FINALIZATION_RECONCILE_STALE_SECONDS` to its 30 s floor and
+   the reconcile interval.
+
 ### Runtime settings
 
 - `OMI_ENV_STAGE=dev`. `utils/env_loader.py:25` accepts only `prod`, `dev`,
@@ -578,6 +701,20 @@ become presigned URLs, and resumable uploads become multipart uploads.
   `OMI_DISABLED_ROUTES` (see "Cut switches").
 - `DIRECTORY_ROUTING_MODE` unset (off), `FAIR_USE_ENABLED=false`,
   `STT_CAP_DISPATCH_ENFORCEMENT=false`.
+- `LISTEN_FINALIZATION_DISPATCH_MODE=in_process` (see "Durable finalization").
+  `LISTEN_FINALIZATION_REPLAY_ENABLED` stays unset (true,
+  `config/listen_finalization.py:6`). `LISTEN_QUIET_FINALIZATION_ENABLED`
+  stays unset (true). `LISTEN_FINALIZATION_TASKS_HANDLER_URL`,
+  `LISTEN_FINALIZATION_TASKS_QUEUE`, `SYNC_TASKS_PROJECT` and
+  `SYNC_TASKS_LOCATION` stay unset, which keeps the Cloud Tasks worker route
+  answering 403.
+- `DEMAND_PROCESSING_ENABLED` unset (false). Demand processing wakes Cloud
+  Tasks directly.
+- `LOCAL_PREVIEW_BATCH_ENABLED=false` and `MOBILE_STANDARD_BATCH_ENABLED`
+  unset (false, `utils/sync/mobile_standard_batch.py:10`). Both lanes defer the
+  live stream and journal audio for the batch upload routes, which are cut.
+  `LOCAL_PREVIEW_BATCH_ENABLED` defaults on (`config/cloud_live_stt.py:56`), so
+  it must be set.
 - `EPISODES_CLIENT_CHANNELS=beta,store`. The default `beta` admits only
   non-production builds (`config/episodes.py:18-25`). Setting both channels
   gives the fork's debug and release builds the same Home episode UI.
@@ -626,7 +763,7 @@ method is still mounted on the same path.
 | Google Calendar and X | `OMI_DISABLED_ROUTERS=google_calendar,calendar_onboarding,calendar_meetings,x_connector`, plus `OMI_DISABLED_ROUTES=POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link` | 404 on `/v1/calendar/*` (including `/v1/calendar/meetings*`, a separate module), `/v1/x/*`, and the three conversation calendar-event routes, which live in the retained `conversations` module | Auto-link returns null on any failure. "Link event" asks to connect Google Calendar, which never connects |
 | Task and app integrations (Google Tasks, Todoist, Asana, ClickUp, Gmail) | `OMI_DISABLED_ROUTES=GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url`, plus provider client ids unset | 404 on the OAuth starts. The status reads stay mounted and return no connections | Startup loads succeed with an empty map. Connect buttons fail. Chat integration tools report unconfigured |
 | Push notifications | `OMI_DISABLED_ROUTES=POST /v1/users/fcm-token`. `firebase_messaging` is removed from the app and `NotificationService` becomes a no-op | 404. With no stored tokens, `utils/notifications.py:246` `_send_to_user` sends nothing. `PUT /v1/users/time-zone` on the same router stays mounted | No push |
-| Offline and SD-card sync upload | `OMI_DISABLED_ROUTES=POST /v2/sync-capture-manifest;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id}` | 404 | The WAL treats only 400 and 413 as definitive refusals (`app/lib/services/wals/wal_policy.dart:113`), so a 404 keeps audio on the device. Phase 2 path is Transcribe batch from S3 |
+| Offline and SD-card sync upload | Client: `--dart-define=OMI_OFFLINE_AUDIO_UPLOAD=false` in the fork build (see "Client: offline audio upload switch"). Server backstop: `OMI_DISABLED_ROUTES=POST /v2/sync-capture-manifest;POST /v1/sync-local-files;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id}` | 404, but the client switch means no automatic caller reaches it | Recordings the live session did not cover stay on the phone, listed as not uploaded, with no upload attempts and no stalled-upload alert. Phase 2 path is Transcribe batch from S3 |
 | Voice messages | `OMI_DISABLED_ROUTES=POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream` | 404, and the WebSocket upgrade is refused | `voice_recorder_provider.dart` catches the failure |
 | TTS | `OMI_DISABLED_ROUTERS=tts` | 404 on `/v2/tts/*` | Playback falls back to the system voice |
 | Speech-profile enrolment | `OMI_DISABLED_ROUTES=GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability` | 404 | `GET /v3/speech-profile` stays mounted and returns `false`. The voice-profile flow's preflight reads the 404 as unavailable and shows `transcription_unavailable` |
@@ -644,6 +781,72 @@ method is still mounted on the same path.
 The exact route spellings above are checked at startup, so the cut card can
 copy them into the fork's runtime env file and get a startup failure if any
 path has drifted.
+
+**Caller retry policy.** A cut is acceptable only when no caller retries it on
+a timer or loops on it. Data retention alone is not enough. Every cut route the
+app can reach was checked for its caller's retry behaviour. The census lists
+the result per route in its
+[cut table](MVP-API-SURFACE.md#cut-routes-and-their-switches). Offline audio
+upload is the only cut whose caller retries automatically, and the client
+switch below removes that caller.
+
+### Client: offline audio upload switch
+
+The app uploads recordings the live session did not cover: audio captured
+while the phone was offline or the socket was down, and SD-card audio
+downloaded from the necklace. Without a client change, cutting the upload
+routes leaves it retrying a 404 indefinitely:
+
+- `autoSyncOfflineRecordings` defaults to true (`app/lib/backend/preferences.dart:741`),
+  and `SyncProvider` passes it to `RecordingTransferCoordinator` as
+  `autoUploadEnabled` (`app/lib/providers/sync_provider.dart:499-500`).
+- A 404 is not a definitive refusal. Only 400 and 413 are
+  (`app/lib/services/wals/wal_policy.dart:113`). The batch upload counts the
+  404 as failed and leaves each WAL in `miss`
+  (`app/lib/services/wals/local_wal_sync.dart:2337-2370`).
+- The coordinator then retries after 5, 10, 20 and 60 seconds, and again on
+  every ten-minute watchdog wake
+  (`app/lib/services/wals/recording_transfer_coordinator.dart:154-157`, `:300-305`,
+  `:504`, `:532-534`). After two hours the Activity page shows an "Upload stalled" row
+  that never clears (`sync_provider.dart:678-683`, `:705-721`).
+
+A server-side terminal refusal (answering 400 instead of 404) was rejected. The
+client would park each WAL as `uploadRejected`, retry the refusal daily for
+about seven days, upload the full audio on every attempt, and tell the user
+the server refused their recording.
+
+**Decision.** Add a compile-time define, `OMI_OFFLINE_AUDIO_UPLOAD`, read as
+`const bool.fromEnvironment('OMI_OFFLINE_AUDIO_UPLOAD', defaultValue: true)`,
+the same pattern as `mobileReferralCampaignEnabled`
+(`app/lib/backend/http/api/referrals.dart:11`). The default keeps upstream
+behaviour. The fork's Flutter build passes `false`. When it is false:
+
+| Seam (paths under `app/lib/`) | Change |
+| --- | --- |
+| `backend/preferences.dart:741` `autoSyncOfflineRecordings` getter | Returns false regardless of the stored preference. This one change turns off every automatic caller: the coordinator's `autoUploadEnabled` (`providers/sync_provider.dart:500`), its watchdog (`services/wals/recording_transfer_coordinator.dart:300`) and its `mayUpload` check (504), Home's SD-card auto-sync on device connect (`pages/home/page.dart:674`), local-preview admission (`services/live_preview/local_preview_admission.dart:84`), and the capture controller (`services/capture/capture_controller.dart:2313`, `:2379`) |
+| `pages/settings/device_settings.dart:546-556` | Hide the Auto Sync toggle, because it can no longer turn anything on |
+| `providers/sync_provider.dart` `syncWals` (837), `syncWal` (861), and the retry paths at 871 and 1113; `providers/local_recordings_provider.dart:187` | Return without waking the coordinator. These are the manual `WakeTrigger.userRetry` entry points, which bypass `mayUpload`. Guarding them in the provider covers every button that calls them. Their buttons in Offline Sync are hidden |
+| `providers/sync_provider.dart:678` `_isUploadStallCandidate` | Returns false, so `observeWalBacklog` (718) never raises the "Upload stalled" row for audio that is deliberately not uploaded |
+
+**What the user sees.** Audio that the live session transcribed is confirmed
+by its conversation and leaves the backlog as usual. Audio the live session
+did not cover stays on the phone in `miss` and is listed in Offline Sync as
+not uploaded, with no sync control and no stalled-upload alert. SD-card audio
+stays on the necklace, because the device-connect auto-sync no longer starts
+(`pages/home/page.dart:674`). WALs are never evicted for count: reaching
+`maxRetainedCaptureWalCount` (720, `services/wals/wal_policy.dart:14`) only
+raises the retention warning. New audio is refused when free space falls below
+`minFreeDiskReserveBytes` (512 MiB, `wal_policy.dart:16`). The user can delete kept recordings from Offline Sync.
+
+**Recovery.** Phase 2 restores the upload routes on Transcribe batch and ships
+a build with the define on. Kept WALs then upload through the normal
+coordinator path. Recordings older than `SYNC_BACKFILL_MAX_AGE_SECONDS`
+(default 30 days, `backend/utils/sync/lanes.py:52`) are refused with 422
+`backfill_lookback_exceeded` (`backend/routers/sync.py:790-797`), so phase 2
+must either raise that setting or accept that older audio stays local.
+
+The server cut stays as a backstop for older fork builds, which would retry as
+described above until updated.
 
 **Full switch values for the fork:**
 
@@ -685,6 +888,12 @@ values above and asserts:
 The census lists are a data file the test reads, so a route marked cut in the
 document cannot stay mounted unnoticed.
 
+The client card adds a test in `app/test/services/wals/recording_transfer_coordinator_test.dart`
+and `app/test/providers/sync_provider_sync_wal_wake_test.dart`, run with
+`--dart-define=OMI_OFFLINE_AUDIO_UPLOAD=false`. It asserts that a pending WAL
+produces no upload on watchdog, connectivity, cooldown or `userRetry` wakes,
+and that no "Upload stalled" row is raised after the silence threshold.
+
 ## Consequences
 
 - **Easier.** One Postgres engine serves the document adapter, CellStore and the
@@ -695,7 +904,9 @@ document cannot stay mounted unnoticed.
   preconditions. It needs a conformance suite run against the offline SDK
   fixture before any route is switched. Firestore's 1 MiB document limit and
   ordering rules become adapter tests, not database guarantees.
-- **Watch.** Aurora auto-pause versus the reconcile loops. Transcribe
+- **Watch.** In-process finalization keeps each wake in the task that admitted
+  it. Revisit SQS when the backend runs more than one task. Recovery latency
+  after a restart is up to 6 minutes, or 26 for a job killed mid-run. Transcribe
   multi-language with diarization. The cross-region `AdminGetUser` call. The
   `omi://` scheme collision. Fargate memory headroom with two containers.
 - **Upstream drift.** New upstream Firestore features reach the fork through
