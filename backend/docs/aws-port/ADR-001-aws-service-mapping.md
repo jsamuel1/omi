@@ -446,9 +446,9 @@ a `RefreshedAuthToken` (73), and `signOut`. Its production implementation is
 harness files implement it as fakes (`git grep -l "implements AuthTokenGateway"`).
 `AuthTokenGateway` keeps those three members unchanged, so the fakes keep
 compiling. A new `AuthSessionGateway extends AuthTokenGateway` adds the session
-members below, and `AuthService` holds an `AuthSessionGateway`. The one seam
-that installs a token-only fake is covered in "Client: non-production auth
-paths". The members:
+members below, and `AuthService` holds an `AuthSessionGateway`. See
+"Token-only injection seams" below for how the existing fakes reach that
+field. The members:
 
 | Member | Contract |
 | --- | --- |
@@ -460,6 +460,51 @@ paths". The members:
 | `Future<AuthSignInResult> signIn()` | Hosted UI authorization code with PKCE. `AuthSignInResult` holds the snapshot and an `isNewUser` flag, replacing `UserCredential` |
 | `Future<void> signOut()` | `/oauth2/revoke` on the refresh token, local wipe, then hosted-UI `/logout` |
 | `Future<void> updateDisplayName(String)` | Local profile field only. The pool is admin-managed |
+
+**Token-only injection seams.** Widening the held field also changes what the
+seams that receive a gateway must supply. Two seams take a gateway from
+outside `auth_service.dart`, and both keep accepting `AuthTokenGateway`:
+
+| Seam | Callers today | Port |
+| --- | --- | --- |
+| `AuthService.forTesting({required AuthTokenGateway tokenGateway, ...})` (`auth_service.dart:106-125`) | 15 test and harness files (`git grep -l "AuthService.forTesting(" app/test app/integration_test`), every one passing a token-only fake | Parameter type unchanged. The initializer assigns `_gateway = asAuthSessionGateway(tokenGateway)` |
+| `installLocalHarnessTokenGateway(AuthTokenGateway)` (`auth_service.dart:136`) | 11 test and harness files (`git grep -l "installLocalHarnessTokenGateway(" app/test app/integration_test`) | Signature and both assertions unchanged. Assigns `_instance._gateway = asAuthSessionGateway(gateway)` |
+
+`asAuthSessionGateway` lives in `services/auth/token_only_session_adapter.dart`
+and is the only conversion. It returns the argument when it already is an
+`AuthSessionGateway`, so a session fake passes through, and otherwise wraps it
+in the private `_TokenOnlySessionAdapter`:
+
+- `currentUser`, `forceRefresh()` and `signOut()` delegate to the wrapped
+  gateway.
+- `userChanges()` emits `currentUser` once. `tokenChanges()` never emits.
+- `restore()` does nothing.
+- `signIn()` and `updateDisplayName()` throw `UnsupportedError`. No token-only
+  caller reaches them today.
+
+No seam casts a gateway, and no caller of either seam changes. The production
+constructor `AuthService._internal()` assigns the selected session gateway
+directly. `AuthService` stores one gateway field (`_tokenGateway` is renamed
+`_gateway`), so every read in `auth_service.dart` goes through the session
+type. `forTesting` drops `firebaseAuth` and `authorizeProviderLink` with the
+link paths; their only caller, `test/unit/auth_provider_link_session_test.dart`,
+is deleted with them ("Client: Firebase retirement").
+
+The direct consumers below never hold a gateway. `AuthService` gains
+`currentUser`, `userChanges()`, `tokenChanges()` and `restoreSession()`, each
+delegating to the held gateway, and consumers call them on
+`AuthService.instance`. A test that injects a token-only fake through either
+seam therefore sees the adapter's behaviour on those paths.
+
+**Compile coverage.** `test/unit/auth_service_token_only_seam_test.dart`
+declares a fake that implements only `AuthTokenGateway`, passes it to
+`AuthService.forTesting(tokenGateway: fake)` with no cast, and asserts that
+`refreshIdToken()` reaches the fake's `forceRefresh`, that `userChanges()`
+emits the fake's `currentUser` once, and that `restoreSession()` completes. A
+second case passes an `AuthSessionGateway` fake and asserts its own
+`userChanges()` stream is the one observed, so the pass-through is not
+wrapped. `flutter analyze` and this test fail if either seam's parameter
+narrows to `AuthSessionGateway`.
 
 `CognitoAuthSessionGateway` implements it. It stores the access, ID and refresh
 tokens in `flutter_secure_storage` (already pinned at `app/pubspec.yaml:79`) and
@@ -481,7 +526,7 @@ migration and link paths (`auth_provider.dart` lines 30-48, `auth_service.dart`
 | `services/auth_service.dart` | 791 `signInWithLocalDevToken` | Becomes `signInLocalDev({uid})` on the local issuer gateway ("Client: non-production auth paths"). Its callers are `providers/auth_provider.dart:210` `onLocalDevSignIn` and physical qualification at `main.dart:357` |
 | `services/auth_service.dart` | 156 `_terminalTokenErrorCodes`, 578 `on FirebaseAuthException` | Becomes `on AuthRefreshException`. The gateway decides terminal or transient, so the Firebase code set is deleted |
 | `services/auth_service.dart` | 405-480 `getIdToken` → `_scheduleLocalDevRecovery` | The re-mint recovery is deleted ("Client: non-production auth paths") |
-| `services/auth_service.dart` | 136 `installLocalHarnessTokenGateway` | Keeps its signature and its debug and `local_dev` assertions. It wraps the token-only fake in an adapter |
+| `services/auth_service.dart` | 106 `AuthService.forTesting`, 136 `installLocalHarnessTokenGateway` | Both keep their `AuthTokenGateway` parameter and wrap it with `asAuthSessionGateway` ("Token-only injection seams") |
 | `pages/onboarding/auth.dart` | 54, 89, 122-130 | Sign-in buttons. The Google and Apple buttons become one hosted-UI button, and the local-development button keys off the selected gateway instead of the profile |
 | `services/auth_service.dart` | 513-580 `refreshIdToken` | Becomes `forceRefresh()` |
 | `services/auth_service.dart` | 993, 1024 | Display-name update. Becomes `updateDisplayName` |
@@ -516,7 +561,7 @@ are in the table above. Paths are relative to `app/`.
 | 24-27, 53-54, 58 | imports `firebase_auth`, `firebase_core`, `firebase_crashlytics`, `firebase_messaging`, `firebase_options_local.dart`, `firebase_options_prod.dart`, `startup_firebase.dart` | removed |
 | 120 | imports `utils/debugging/crashlytics_manager.dart` | imports `utils/debugging/crash_reporter.dart` |
 | 131-147 | `_firebaseOptionsForFlavor`, `_ensureFirebaseApp` | deleted |
-| 150-154 | `onDeviceOverflowBackground` initializes Firebase, then Opus | keeps the `vm:entry-point`. Its `initialize` calls `AuthSessionGateway.instance.restore()` (reads `flutter_secure_storage`, no network) instead of `_ensureFirebaseApp`, because `on_device_background.dart:35,49` now asks the gateway for the owner |
+| 150-154 | `onDeviceOverflowBackground` initializes Firebase, then Opus | keeps the `vm:entry-point`. Its `initialize` calls `AuthService.instance.restoreSession()`, which delegates to the held gateway's `restore()` (reads `flutter_secure_storage`, no network) instead of `_ensureFirebaseApp`, because `on_device_background.dart:35,49` now asks the gateway for the owner |
 | 157-196 | `_firebaseMessagingBackgroundHandler(RemoteMessage)` | deleted. With no FCM there is no background data message. The handlers it called (`ActionItemNotificationHandler`, `MergeNotificationHandler`, `ImportantConversationNotificationHandler`, `ChatAnswerNotificationHandler`) stay, because the foreground paths and tests use them |
 | 214-245 `_reportBootCrash` | journals breadcrumbs, then returns if `Firebase.apps.isEmpty`, else writes to `FirebaseCrashlytics` | journals breadcrumbs, then calls `CrashReporter.instance.recordBoot(kind, error, stack, details: details, fatal: fatal, origin: errorOrigin)`. The `Firebase.apps` guard goes |
 | 270 | `startupStage('firebase_init', _ensureFirebaseApp)` | deleted. The `auth_restore` stage that `CognitoAuthSessionGateway` adds runs in the same position, before `BootCrashHandlers.install` |
@@ -619,7 +664,10 @@ already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
 - `refreshSession` takes an `AuthUserSnapshot` and the access token from
   `tokenChanges()` in place of the Firebase `User` and `IdTokenResult`. It runs
   on every emission, so the Keychain mirror always holds the newest access
-  token and its `exp`.
+  token and its `exp`. Its two callers move with it: `auth_provider.dart:142`
+  (the `idTokenChanges` listener, now `tokenChanges()`) and
+  `siri_integration.dart:575`, which passes `AuthService.instance.currentUser`
+  and the current access token.
 - `requireFirebaseOwner` becomes `requireMirroredOwner(uid)`: the current
   config's uid must equal `uid` and the mirrored token must exist. It keeps the
   protected-data branch (`setAuthResolutionPending`).
@@ -671,7 +719,6 @@ already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
 - Tests that import Firebase test interfaces move to an `AuthSessionGateway`
   fake: `test/services/siri_integration_test.dart`,
   `test/utils/auth/sign_in_failure_test.dart`,
-  `test/unit/auth_provider_link_session_test.dart`,
   `test/unit/authenticated_request_401_test.dart`,
   `test/unit/auth_service_token_result_test.dart`,
   `test/widgets/home_calendar_filter_test.dart`,
@@ -682,11 +729,14 @@ already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
 - Tests and harnesses that construct `FirebaseAuthException` to script a
   refresh outcome throw `AuthRefreshException` instead ("Refresh failures"
   below): `integration_test/journeys/support/hermetic_boot.dart`,
-  `test/unit/auth_provider_link_session_test.dart`,
   `test/unit/auth_service_token_result_test.dart`,
   `test/unit/authenticated_request_401_test.dart`,
   `test/unit/token_refresh_loop_test.dart` and
   `test/utils/auth/sign_in_failure_test.dart`.
+- `test/unit/auth_provider_link_session_test.dart` is deleted. Its five cases
+  cover Google and Apple provider linking and credential collisions, which go
+  with the link paths, and it is the only caller of the `firebaseAuth` and
+  `authorizeProviderLink` parameters of `AuthService.forTesting`.
 - `integration_test/perf/production_shell.dart` imports `firebase_auth`,
   `firebase_core`, `firebase_crashlytics`, `firebase_messaging` and
   `firebase_options_local.dart` (18-21, 46). It is generated from `main.dart`
@@ -843,9 +893,9 @@ already in `backend/requirements.txt` and `backend/pusher/requirements.txt`.
   false, and 122-130 show the local-development button when it is true.
   `onLocalDevSignIn` calls `signInLocalDev()`.
 - `installLocalHarnessTokenGateway(AuthTokenGateway)` (`auth_service.dart:136`)
-  keeps its signature and both assertions. It wraps the fake in a private
-  adapter: `userChanges()` emits `currentUser` once, `tokenChanges()` never
-  emits, `restore()` does nothing and `signIn()` throws `UnsupportedError`.
+  keeps its signature and both assertions, and wraps the fake with
+  `asAuthSessionGateway`, the same adapter `AuthService.forTesting` uses
+  ("Token-only injection seams").
 
 **Refresh failures.** New `services/auth/auth_refresh_exception.dart`:
 `AuthRefreshException(String code, {required bool terminal})`. Both gateways
