@@ -120,18 +120,31 @@ client-device, rollout-cohort or rate-limit dependencies apply to them:
 - `GET /v2/firmware/stable` (`routers/firmware.py:408`).
 - `GET /v2/firmware/latest` (`routers/firmware.py:360`). Its only token use
   is optional: when a fetched release carries a uid allowlist,
-  `_request_audience` (331) calls `_verified_uid` (343), which runs
+  `_request_audience` (331) calls `_verified_uid` (347), which runs
   `verify_token` on the `Authorization` header if present. A missing or
-  invalid token yields no uid and the request still succeeds, without the
-  allowlisted releases. The app channel header is read the same way. After
-  the port this call verifies a Cognito token against the pool JWKS, with no
-  fences and no Redis.
+  rejected token, or a key set that cannot be fetched, yields no uid and the
+  request still succeeds, without the allowlisted releases. The app channel
+  header is read the same way. After the port this call verifies a Cognito
+  token against the pool JWKS, with no fences and no Redis, and logs an
+  unavailable key set at warning (ADR-001, "Every direct auth boundary").
 
 | Today | After the port |
 | --- | --- |
 | Firebase ID token, `firebase_admin.auth.verify_id_token` | Cognito access token from pool `ap-southeast-4_jA7oAYYrp`, verified with PyJWT against the pool JWKS, uid = `sub` |
 | Client gets the token from `FirebaseAuth.currentUser.getIdToken` (`services/auth_service.dart`) | Client gets it from the hosted UI PKCE exchange at `https://auth.home.sauhsoj.wtf/oauth2/token` and refreshes with the refresh token |
 | Header `Authorization: Bearer <token>` set in `backend/http/shared.dart:263` | Unchanged |
+
+**Failure mapping.** Every dependency in the table above answers the same
+way after the port, through one mapping in `utils/other/auth_tokens.py`
+(ADR-001, "Verification failures"). An invalid token is HTTP 401, or close
+1008 on `/v4/listen`. An expired token is HTTP 401, or close 4001, which
+makes the client refresh and reconnect. A JWKS endpoint that cannot be
+reached, or an unknown signing key during the refresh cooldown, is HTTP 503
+`auth_provider_unavailable` with `Retry-After: 1`, or close 1013, so the
+client retries instead of signing out. Executor saturation keeps its 503 and
+1013. Today the three `except InvalidIdTokenError` clauses in
+`endpoints.py` (227, 292, 360) are the only HTTP mapping, so a PyJWT
+exception that reached them unchanged would answer 500.
 
 Rate-limit counters live in Redis (`REDIS_DB_HOST`, now Valkey over TLS with
 `REDIS_DB_TLS=true`, ADR-001 "Valkey: TLS on every client"), and the
@@ -143,7 +156,11 @@ mention in the rows below uses the same endpoint and TLS settings.
 
 There is no backend sign-in route in the MVP. The app signs in against the
 Cognito hosted UI directly. `/v1/auth/*` (`routers/auth.py`, the Firebase
-custom-token flow for Google and Apple) is cut.
+custom-token flow for Google and Apple, and the local-dev custom-token route)
+is cut. Local and test builds sign in through the backend's local issuer at
+`/_local/auth/token`, which mounts only under `OMI_ENV_STAGE` `local` or
+`offline` (ADR-001, "Client: non-production auth paths"); it is not part of
+the deployed surface.
 
 **Startup order.** Before any product traffic, `main.dart:383-387` binds the
 signed-in owner with `AccountCutoverRuntime.bindAuthenticatedOwner`, which
@@ -507,7 +524,8 @@ caller is one-shot or user-triggered.
 
 | Area | Routes the app can call | Switch entry | Caller retry policy |
 | --- | --- | --- | --- |
-| Firebase sign-in | `/v1/auth/*` (`POST /v1/auth/token`, `POST /v1/auth/local-dev/custom-token`, `/v1/auth/authorize`) | `OMI_DISABLED_ROUTERS=auth` | None. The app signs in through the Cognito hosted UI and never calls these |
+| Firebase sign-in | `/v1/auth/*` (`POST /v1/auth/token`, `POST /v1/auth/local-dev/custom-token`, `/v1/auth/authorize`) | `OMI_DISABLED_ROUTERS=auth` | None. The app signs in through the Cognito hosted UI and never calls these. Local and test builds use `/_local/auth/token` instead, which is absent from the deployed stage |
+| Firebase-JS consent pages | `GET /v1/oauth/authorize`, `POST /v1/oauth/token` (`routers/oauth.py`, app-integration OAuth), and MCP OAuth `GET /authorize`, `POST /authorize` (`routers/mcp_sse.py:193,219`) | `OMI_DISABLED_ROUTERS=oauth`, plus `OMI_DISABLED_ROUTES=GET /authorize;POST /authorize` | None. These browser pages sign in with the Firebase JS SDK and post a `firebase_id_token`, which no longer exists. MCP clients keep MCP API keys (`/v1/mcp` stays mounted) |
 | Push | `POST /v1/users/fcm-token` | `OMI_DISABLED_ROUTES` `POST /v1/users/fcm-token` | None. `NotificationService` is local-only and never reads a push token, so the call never runs |
 | Offline and SD-card sync upload | `POST /v2/sync-capture-manifest`, `POST /v1/sync-local-files`, `POST /v2/sync-local-files`, `POST /v2/sync-local-files/{job_id}/release-hold`, `GET /v2/sync-local-files/{job_id}` | `OMI_DISABLED_ROUTES`, one entry each, as a server backstop. The client switch is `--dart-define=OMI_OFFLINE_AUDIO_UPLOAD=false` | **Automatic and unbounded without a client change.** The transfer coordinator retries a 404 after 5, 10, 20 and 60 s, then on every ten-minute watchdog wake. The fork build sets `OMI_OFFLINE_AUDIO_UPLOAD=false`, which stops every automatic and manual caller (ADR-001, "Client: offline audio upload switch") |
 | Search | `POST /v1/conversations/search` | `OMI_DISABLED_ROUTES` `POST /v1/conversations/search` | One request per query the user types. No retry |

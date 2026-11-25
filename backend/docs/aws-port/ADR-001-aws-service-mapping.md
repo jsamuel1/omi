@@ -57,7 +57,7 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | GCP / third-party dependency | AWS replacement (chosen) | Rejected alternative (reason) | Swap seam | Ports/cells |
 | --- | --- | --- | --- | --- |
 | Firestore (document store, transactions, queries, aggregations) | Aurora Serverless v2 PostgreSQL 16, accessed through a Firestore GAPIC-surface adapter over `jsonb` tables | DynamoDB (100-item transaction cap, no interactive read-then-write transactions, 20 GSI cap against 271 indexes, 400 KB items) | `database/_client.py::_build_firestore_client` (line 212) builds `firestore.Client` with an injected `_firestore_api` | No. Ports/cells cover 5 non-MVP domains only |
-| Firebase Auth (ID token verify) | Cognito access token, verified with PyJWT 2.15.1 `PyJWKClient` against the pool JWKS | Cognito ID token (carries no `client_id` claim and is meant for the client, not resource servers) | `utils/other/endpoints.py::verify_token` (143), `_verify_ws_auth` (390), `dependencies.py::get_current_user_id` (64) | No |
+| Firebase Auth (ID token verify) | Cognito access token, verified with PyJWT 2.15.1 `PyJWKClient` against the pool JWKS, with failures raised as provider-neutral types (see "Verification failures") | Cognito ID token (carries no `client_id` claim and is meant for the client, not resource servers) | `utils/other/endpoints.py::verify_token` (143), `_verify_ws_auth` (390), `dependencies.py::get_current_user_id` (64), and the other boundaries under "Every direct auth boundary"; new `utils/other/auth_tokens.py` | No |
 | Firebase Admin user lookup | `cognito-idp:AdminGetUser(Username=sub)` behind a normalizing adapter that returns the Firebase `UserRecord` attribute shape (see "User lookup adapter") | `ListUsers` with a `sub` filter (needs a second permission, returns a list to page and disambiguate) | `database/auth.py::_firebase_get_user` (line 13), plus the raw `auth.get_user` sites listed in "User lookup adapter" | No |
 | Firebase custom-token sign-in (`/v1/auth/*`, Google and Apple) | Cut. Cognito hosted UI with PKCE replaces it | Federating Google and Apple IdPs into the pool now (the pool has COGNITO as its only IdP, and the owner admin-creates users) | `routers/auth.py` stops being called by the client | No |
 | GCS buckets | S3, one bucket per `BUCKET_*` env var, behind a new `S3StorageClient` | One shared bucket with prefixes (breaks per-bucket lifecycle and IAM scoping that the env-var split already implies) | `utils/other/local_storage.py::create_storage_client` (line 348), plus direct `google.cloud.storage` importers listed below | No |
@@ -173,17 +173,118 @@ already does for the Firebase token. `verify_token` checks, in order: RS256
 signature against the cached JWKS, `iss` equals the pool issuer,
 `token_use == "access"`, `client_id` in an allowlist env var
 (`COGNITO_ALLOWED_CLIENT_IDS`), and `exp`. It returns `sub` as the uid. The same
-function backs `_verify_ws_auth`, so `/v4/listen` gets the change for free. Map
-`jwt.ExpiredSignatureError` to WebSocket close 4001 (refresh) and every other
-verification failure to 1008. The existing `_get_ws_auth_close` keeps that
-split for Firebase errors.
+function backs `_verify_ws_auth`, so `/v4/listen` gets the change for free.
+`main.py` and `pusher/main.py` must skip `firebase_admin.initialize_app`.
 
-Other auth seams: `dependencies.py::get_current_user_id` (64),
-`routers/oauth.py`, `utils/mcp_server/oauth.py`, plus the Firebase verify call
-sites in `routers/transcribe.py`, `routers/mcp.py`, `routers/mcp_sse.py`,
-`routers/apps.py`, `routers/referrals.py`, `routers/support.py` and
-`routers/public_shared_conversation_chat.py`. `main.py` and `pusher/main.py`
-must skip `firebase_admin.initialize_app`.
+**Verification failures.** Today's callers catch Firebase exception classes:
+`InvalidIdTokenError` at `utils/other/endpoints.py:227`, `:292` and `:360`,
+`(InvalidIdTokenError, CertificateFetchError)` in `_verify_ws_auth` (407), and
+`InvalidIdTokenError` in `routers/transcribe.py:281`. PyJWT raises its own
+family, so a bare swap would turn every rejected token on those HTTP routes
+into a 500. The verifier therefore never lets a PyJWT or `PyJWKClient`
+exception escape. It raises one of three provider-neutral types from a new
+`utils/other/auth_tokens.py`, and two mapping functions in the same module
+turn them into the transport answer:
+
+| Type | Meaning | Raised for (PyJWT 2.15.1) |
+| --- | --- | --- |
+| `AuthCredentialExpired(AuthCredentialError)` | The client sent a well-formed token past `exp`. It should refresh | `jwt.ExpiredSignatureError` |
+| `AuthCredentialInvalid(AuthCredentialError)` | The client sent a token this service will never accept | every other `jwt.InvalidTokenError` subclass (`DecodeError`, `InvalidSignatureError`, `InvalidIssuerError`, `InvalidAudienceError`, `InvalidAlgorithmError`, `ImmatureSignatureError`, `InvalidIssuedAtError`, `MissingRequiredClaimError`), a header `alg` other than RS256, `token_use != "access"`, a `client_id` outside the allowlist, and a `kid` that is still unknown after a JWKS refresh |
+| `AuthProviderUnavailable` (not an `AuthCredentialError`) | The server could not evaluate the token | `jwt.PyJWKClientError` (including `PyJWKClientConnectionError`) and `jwt.PyJWKSetError` from fetching the key set, and an unknown `kid` while a refresh is suppressed by the cooldown below |
+
+The split between "unknown kid" and "key set unavailable" cannot come from
+`PyJWKClient.get_signing_key_from_jwt`: it raises the same plain
+`PyJWKClientError` for a `kid` with no match and for a JWKS endpoint that
+returned a non-object. The verifier does the lookup itself instead:
+`jwt.get_unverified_header` (a `DecodeError` is invalid), then
+`client.get_signing_keys()` inside a `try` that maps every `PyJWTError` to
+`AuthProviderUnavailable`, then the static `PyJWKClient.match_kid`. On no
+match it calls `get_signing_keys(refresh=True)` at most once per 30 s (a
+module-level monotonic timestamp under a lock). A `kid` still unknown after a
+successful refresh is `AuthCredentialInvalid`. A `kid` unknown during the
+cooldown is `AuthProviderUnavailable`, because the server has not checked the
+current key set. The client is built with `timeout=5` and `lifespan=300`, so a
+hung JWKS endpoint holds a worker for 5 s, not PyJWKClient's default 30 s.
+
+Any other exception from the verifier is a bug and propagates. HTTP callers
+answer 500 for it, and WebSocket callers close with 1011.
+
+`http_auth_exception(error)` and `ws_auth_close(error)` are the only mapping:
+
+| Failure | HTTP | WebSocket close | Log level |
+| --- | --- | --- | --- |
+| `AuthCredentialInvalid` | 401 `Invalid authorization token` | 1008 | warning |
+| `AuthCredentialExpired` | 401 `Invalid authorization token` | 4001 | warning |
+| `AuthProviderUnavailable` | 503 `{"code": "auth_provider_unavailable", "retryable": true}`, `Retry-After: 1` | 1013 | error |
+| `ExecutorSaturatedError` around the verify call | 503, `Retry-After: 1` (`dependencies.py:73-78`, `endpoints.py::_executor_saturated_http_exception`, 70) | 1013 (`run_critical_ws`, 79) | unchanged |
+| Unexpected exception | 500 | 1011 | error |
+
+The client already treats these correctly. On HTTP, only a 401 triggers
+refresh and replay (`app/lib/backend/http/shared.dart:380`), so a 503 never
+signs the user out. On the socket, 4001 refreshes the token and reconnects
+(`services/capture/capture_controller.dart:3470`), 1008 is terminal
+(`services/capture/capture_live_recovery.dart:57`), and 1013 and 1011 are
+not in that terminal set, so live recovery retries them with backoff. Today
+`_get_ws_auth_close` (446) maps Google's `CertificateFetchError` to 4001,
+which makes the client refresh a token that was never the problem. It also
+sniffs `'expired'` and `'certificate'` in exception text. Both go: the close
+code comes from the type alone. Close 4004 (relogin) keeps its constant but
+has no auth producer, because offline verification cannot see revocation
+(accepted gap below).
+
+**Every direct auth boundary.** Each site below calls the verifier and maps
+its failures through the two functions, so no caller names a provider
+exception:
+
+| Boundary | Callers | Port |
+| --- | --- | --- |
+| `utils/other/endpoints.py::get_current_user_uid` (271), `get_current_user_uid_no_byok_validation` (334), `get_current_user_uid_for_deletion_status` (199), and `get_current_user_uid_readonly` (257) through the last | every authenticated MVP HTTP row (census, "Shared auth chain") | `except AuthCredentialError, AuthProviderUnavailable` → `raise http_auth_exception(e)`, replacing the three `except InvalidIdTokenError` clauses |
+| `dependencies.py::get_current_user_id` (64) | `routers/api_key_management.py`, `routers/mcp.py` (not reached by the app) | `run_blocking(critical_executor, verify_token, ...)`. Saturation keeps its 503. The verifier's types go through `http_auth_exception`. The bare `except Exception` → 401 (79-81) goes, so an unavailable key set is a 503 |
+| `_verify_ws_auth` (390), used by `get_current_user_uid_ws_listen` (462) and `get_current_user_uid_ws` (513) | `WS /v4/listen` | `except (AuthCredentialError, AuthProviderUnavailable)` → `WebSocketException(ws_auth_close(e))`. The `except Exception` → 1008 (412) becomes 1011 |
+| `get_current_user_uid_from_ws_message` (583), with `_verify_user_uid_from_ws_message` (545) | `WS /v4/web/listen` (`routers/transcribe.py:246`, the web app, not the Flutter app) | Translates the verifier's types into `WebSocketException` the same way. `routers/transcribe.py` drops its `except InvalidIdTokenError` clause (281). Its existing `except WebSocketException` (285) then sends `auth_response: false` and closes with the mapped code. Format errors stay `ValueError` → 1008 |
+| `routers/firmware.py::_verified_uid` (347) | `GET /v2/firmware/latest` | Fail-soft as today: any failure returns no uid and the release allowlist does not match. It logs `AuthProviderUnavailable` at warning, so a JWKS outage is visible |
+| `utils/support_auth.py::get_support_caller_uid` (11) | `/v1/support/*` (not reached by the app) | Calls `verify_token` instead of `auth.verify_id_token`, then `http_auth_exception` (401 or 503) |
+| `routers/public_shared_conversation_chat.py` (100-114) | `POST /v1/conversations/shared/chat` with `X-Omi-User-Id-Token` (the web share page, not the Flutter app) | `run_blocking(critical_executor, verify_token, ...)`. A credential error keeps the 401 `invalid_token` body. `AuthProviderUnavailable` and saturation answer 503 `auth_provider_unavailable` instead of the bare `except Exception` → 401 |
+| `routers/oauth.py::oauth_token` (165) and `utils/mcp_server/oauth.py::mcp_authorize_consent` (307) | browser pages that sign in with the Firebase JS SDK (`templates/oauth_authenticate.html`, `templates/mcp_oauth_authorize.html:9-12`) and post a `firebase_id_token` | Cut: `OMI_DISABLED_ROUTERS=oauth` and `OMI_DISABLED_ROUTES=GET /authorize;POST /authorize` (see "Cut switches"). Without Firebase those pages cannot produce a token. A Cognito hosted-UI consent page is follow-up work |
+| `routers/apps.py:1864` (`POST /v1/apps/migrate-owner`) | anonymous-account migration | Cut with the `apps` router. The pool has no anonymous users |
+| `routers/auth.py` | Firebase sign-in | Cut with the `auth` router |
+
+**Tests (auth card).**
+
+- New `tests/unit/test_auth_tokens.py`, with an RSA key pair and a stubbed
+  JWKS endpoint. A valid access token returns `sub`. Each PyJWT failure in the
+  type table raises its mapped type: expired, bad signature, wrong `iss`, any
+  `aud` (a Cognito ID token), `alg` HS256 or none, a future `nbf`, a missing
+  `client_id`, `token_use: id`, a disallowed `client_id`, and garbage input.
+  For the key set: a connection error, a non-object body and an empty set each
+  raise `AuthProviderUnavailable`. An unknown `kid` raises
+  `AuthCredentialInvalid` after one refresh, and `AuthProviderUnavailable`
+  when a second unknown `kid` arrives inside the cooldown. No PyJWT exception
+  type escapes any case.
+- New `tests/unit/test_auth_transport_mapping.py`, parametrized over every
+  boundary in the table above × {invalid, expired, unavailable, saturated}. It
+  asserts the status, detail and `Retry-After` for HTTP, and the close code
+  (plus `auth_response: false` for `/v4/web/listen`) for WebSocket. The
+  firmware case asserts the request still succeeds without the allowlisted
+  release.
+- `tests/unit/test_ws_auth_handshake.py`: the certificate-fetch case expects
+  1013, not 4001. The revoked → 4004 case and the two message-sniffing cases
+  (209, 228) are deleted. The unexpected-error case (266) expects 1011.
+- `tests/unit/test_ws_auth_rejection_logging.py`: credential types log at
+  warning and `AuthProviderUnavailable` at error.
+  `docs/operational/ws-auth-rejection-severity.md` changes its table to the
+  three types.
+- `tests/unit/test_dependency_async_boundaries.py`: `get_current_user_id`
+  still offloads to `critical_executor`, and an unavailable key set now gives
+  503 (the case at 476 gives 401 for an invalid token).
+- `tests/unit/test_verify_token_admin_and_local_dev_gating.py` keeps the
+  `ADMIN_KEY` gating cases and loses the `'123'` local-development cases.
+- 30 test modules stub `firebase_admin.auth` exception classes into
+  `sys.modules` because `endpoints.py` imports them
+  (`grep -rl "InvalidIdTokenError\|CertificateFetchError" backend/tests`).
+  They drop those stubs. A guard test fails if `utils/other/endpoints.py`,
+  `dependencies.py`, `utils/support_auth.py`, `routers/transcribe.py` or
+  `routers/public_shared_conversation_chat.py` imports `firebase_admin`.
 
 **User lookup adapter.** `database/auth.py::get_user_from_uid` keeps its
 contract: it returns `None` or a dict with exactly the keys `uid`, `email`,
@@ -290,6 +391,8 @@ is one exact read.
 - `LOCAL_DEVELOPMENT` unset. Its `'123'` uid bypass in `verify_token` fires
   when no Google credential variable is set, which will be true on AWS.
   The new verifier must drop that branch.
+- `OMI_LOCAL_AUTH_SIGNING_KEY_PATH` unset. Under `OMI_ENV_STAGE=dev` the
+  backend refuses to start with it set ("Client: non-production auth paths").
 
 **Accepted gaps:**
 
@@ -335,19 +438,25 @@ directly. Repointing only the sign-in call would leave those bound to Firebase,
 and the sign-in methods return Firebase `UserCredential`, which cannot carry a
 Cognito session.
 
-**Decision.** Widen the existing provider-neutral seam instead of adding a
-second one. `AuthTokenGateway` (`services/auth/auth_token_result.dart:80`)
+**Decision.** Extend the existing provider-neutral seam instead of adding a
+parallel one. `AuthTokenGateway` (`services/auth/auth_token_result.dart:80`)
 already exposes `currentUser` as an `AuthUserSnapshot` (60), `forceRefresh` as
-a `RefreshedAuthToken` (73), and `signOut`. Its only implementation is
-`_FirebaseAuthTokenGateway` (`services/auth_service.dart:27`). Rename it
-`AuthSessionGateway` and add:
+a `RefreshedAuthToken` (73), and `signOut`. Its production implementation is
+`_FirebaseAuthTokenGateway` (`services/auth_service.dart:27`), and 25 test and
+harness files implement it as fakes (`git grep -l "implements AuthTokenGateway"`).
+`AuthTokenGateway` keeps those three members unchanged, so the fakes keep
+compiling. A new `AuthSessionGateway extends AuthTokenGateway` adds the session
+members below, and `AuthService` holds an `AuthSessionGateway`. The one seam
+that installs a token-only fake is covered in "Client: non-production auth
+paths". The members:
 
 | Member | Contract |
 | --- | --- |
 | `AuthUserSnapshot? get currentUser` | Synchronous, from the in-memory session. `uid` is the Cognito `sub` |
 | `Stream<AuthUserSnapshot?> userChanges()` | Emits on sign-in, sign-out and account switch. Replaces `authStateChanges()` |
 | `Stream<RefreshedAuthToken> tokenChanges()` | Emits after each refresh. Replaces `idTokenChanges()` |
-| `Future<RefreshedAuthToken?> forceRefresh()` | Refresh-token grant against `/oauth2/token` |
+| `Future<RefreshedAuthToken?> forceRefresh()` | Refresh-token grant against `/oauth2/token`. A failed grant throws `AuthRefreshException(code, terminal:)`: token-endpoint error `invalid_grant`, `invalid_client` or `unauthorized_client` is terminal, and HTTP 429, 5xx, a timeout, a socket error or an unparseable body is transient (see "Refresh failures" in "Client: non-production auth paths") |
+| `Future<void> restore()` | Reads the stored session from `flutter_secure_storage`. No network |
 | `Future<AuthSignInResult> signIn()` | Hosted UI authorization code with PKCE. `AuthSignInResult` holds the snapshot and an `isNewUser` flag, replacing `UserCredential` |
 | `Future<void> signOut()` | `/oauth2/revoke` on the refresh token, local wipe, then hosted-UI `/logout` |
 | `Future<void> updateDisplayName(String)` | Local profile field only. The pool is admin-managed |
@@ -369,7 +478,11 @@ migration and link paths (`auth_provider.dart` lines 30-48, `auth_service.dart`
 | `services/auth_service.dart` | 30, 42, 48, 176 | The current gateway implementation |
 | `services/auth_service.dart` | 247, 284 | Google and Apple sign-in. Deleted |
 | `services/auth_service.dart` | 648 `authenticateWithProvider`, 842 `_signInWithOAuthCredentials` | Becomes `signIn()` against `/oauth2/authorize` |
-| `services/auth_service.dart` | 791 `signInWithLocalDevToken` | Deleted with the backend local-dev token route |
+| `services/auth_service.dart` | 791 `signInWithLocalDevToken` | Becomes `signInLocalDev({uid})` on the local issuer gateway ("Client: non-production auth paths"). Its callers are `providers/auth_provider.dart:210` `onLocalDevSignIn` and physical qualification at `main.dart:357` |
+| `services/auth_service.dart` | 156 `_terminalTokenErrorCodes`, 578 `on FirebaseAuthException` | Becomes `on AuthRefreshException`. The gateway decides terminal or transient, so the Firebase code set is deleted |
+| `services/auth_service.dart` | 405-480 `getIdToken` → `_scheduleLocalDevRecovery` | The re-mint recovery is deleted ("Client: non-production auth paths") |
+| `services/auth_service.dart` | 136 `installLocalHarnessTokenGateway` | Keeps its signature and its debug and `local_dev` assertions. It wraps the token-only fake in an adapter |
+| `pages/onboarding/auth.dart` | 54, 89, 122-130 | Sign-in buttons. The Google and Apple buttons become one hosted-UI button, and the local-development button keys off the selected gateway instead of the profile |
 | `services/auth_service.dart` | 513-580 `refreshIdToken` | Becomes `forceRefresh()` |
 | `services/auth_service.dart` | 993, 1024 | Display-name update. Becomes `updateDisplayName` |
 | `providers/auth_provider.dart` | 50, 80, 99, 187, 190 | Signed-in and owner checks |
@@ -486,14 +599,13 @@ its public members (`init`, `applyBuildProvenanceKeys`, `identifyUser`,
 
 - `env/env.dart:10-15,139` (`firebaseAuthEmulatorHost`/`Port`) and `166-172`
   (`validateFirebaseProject`) are deleted. `env/environment_profile.dart`
-  drops `firebaseProjectId` and `usesFirebaseAuthEmulator`.
-- `env/physical_qualification.dart` is compiled in only with
-  `--dart-define=OMI_PHYSICAL_QUALIFICATION=true`, which the fork does not set,
-  but it must still compile. Lines 137 and 146 drop the emulator host from the
-  private-endpoint check and the HTTP allowlist. Lines 152-154 drop the three
-  native Firebase collection flags, and `ios/Runner/AppDelegate.swift:302-304`
-  stops reporting them (`ios/test/check_userdefaults_plist_values.py:17-19`
-  follows).
+  drops `firebaseProjectId` and `usesFirebaseAuthEmulator`, and
+  `test/unit/env_test.dart:56,63,77` drops those assertions.
+- Physical qualification, the hermetic journeys, the simulator lane and the
+  session harness sign in through the local issuer instead of the Auth
+  emulator. "Client: non-production auth paths" below owns every one of those
+  entrypoints, including `env/physical_qualification.dart` and
+  `ios/Runner/AppDelegate.swift:302-304`.
 
 **iOS Siri (native).** `ios/Runner/SiriIntegration/SiriSession.swift`,
 `SiriBridge.swift` and `SiriDebugProbe.swift` import `FirebaseAuth` and
@@ -567,6 +679,21 @@ already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
   `test/widgets/home_product_mounted_guard_test.dart`,
   `test/providers/device_provider_fully_charged_alert_test.dart` and
   `test/providers/device_provider_disconnect_telemetry_test.dart`.
+- Tests and harnesses that construct `FirebaseAuthException` to script a
+  refresh outcome throw `AuthRefreshException` instead ("Refresh failures"
+  below): `integration_test/journeys/support/hermetic_boot.dart`,
+  `test/unit/auth_provider_link_session_test.dart`,
+  `test/unit/auth_service_token_result_test.dart`,
+  `test/unit/authenticated_request_401_test.dart`,
+  `test/unit/token_refresh_loop_test.dart` and
+  `test/utils/auth/sign_in_failure_test.dart`.
+- `integration_test/perf/production_shell.dart` imports `firebase_auth`,
+  `firebase_core`, `firebase_crashlytics`, `firebase_messaging` and
+  `firebase_options_local.dart` (18-21, 46). It is generated from `main.dart`
+  by `app/tool/perf_shell.py`. The auth card regenerates it after the
+  `main.dart` changes, and `python3 app/tool/perf_shell.py --check` (run by
+  `app/test.sh:15` and the `mobile-perf-shell-fidelity` entry of
+  `.github/checks-manifest.yaml`) passes on the result.
 
 **Compile and startup checks (auth card).**
 
@@ -597,6 +724,299 @@ already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
 
 **Acceptance check for the auth card:** checks 1-6 pass, and sign-in, cold
 restore, sign-out and account switch work against the pool.
+
+### Client: non-production auth paths
+
+Five entrypoints sign in without a person at the hosted UI, and each one
+depends on the Firebase Auth emulator or on Firebase exception types today:
+
+- **Physical qualification.** `main.dart:350-359` calls
+  `signInWithLocalDevToken(uid: fixtureUid)` under
+  `OMI_PHYSICAL_QUALIFICATION`. `PhysicalQualification.install`
+  (`env/physical_qualification.dart:126-158`) requires a private emulator host
+  and the three native Firebase collection flags. The fixture backend
+  (`scripts/dev-harness/physical_capture_fixtures/server.py`) mints an
+  unsigned custom token at `/v1/auth/local-dev/custom-token` (218) and checks
+  each bearer token through the emulator's `accounts:lookup` (179-191).
+- **Hermetic journeys.** `integration_test/journeys/support/hermetic_boot.dart`
+  installs token-only fakes through `installLocalHarnessTokenGateway`, and
+  `ScriptableGateway.forceRefresh` throws `FirebaseAuthException` to script
+  terminal and transient outcomes (188-200). j4 asserts the local-dev re-mint
+  reaches `POST /v1/auth/local-dev/custom-token`
+  (`j4_expired_session_recovery_test.dart:52-63`).
+- **Simulator lane.** `run_journeys.sh --lane simulator` boots the real app
+  against the session harness. The journeys README (60, 65) says it uses real
+  FirebaseAuth against the Auth emulator.
+- **Session and memory harness.** `dev_harness/config.py:368-372` starts the
+  backend with `FIREBASE_AUTH_EMULATOR_HOST`, `cli.py:664-684` starts the Auth
+  emulator, `mobile_fixtures.seed_synthetic_user` (113) posts to the custom-token
+  route, and `memory_scenarios.py:995-1012` and
+  `chat-first-e2e-fixture.sh` sign in with `accounts:signInWithPassword`.
+- **Developer sign-in.** `pages/onboarding/auth.dart:122-130` shows a
+  local-development button that calls `AuthProvider.onLocalDevSignIn`
+  (`providers/auth_provider.dart:210`).
+
+**Decision.** Replace the Auth emulator with a local issuer inside the
+backend, and give the app a second `AuthSessionGateway` implementation that
+talks to it. Every non-production entrypoint then signs in through the same
+gateway contract as production, the backend verifies through the same
+`verify_token` and the same failure mapping, and no Firebase package or
+emulator is left in any lane.
+
+**Rejected.**
+
+- Keeping the Auth emulator for test lanes. It keeps `firebase_auth` in the
+  app, which the retirement removes, and its tokens are Firebase-shaped, so
+  `verify_token` would need a Firebase branch kept alive only for tests.
+- A Cognito emulator (`cognito-local`, moto). Neither is in either requirements
+  file, and their hosted-UI and token-endpoint behaviour is not the pool's.
+- A real test user in the pool. It needs network, which breaks
+  qualification's private-literal isolation, puts a password in every harness,
+  and adds a user to a pool shared with other `sauhsoj.wtf` apps.
+- `ADMIN_KEY` from the app. It is an impersonation credential, and the fork
+  runs with `ADMIN_KEY_AUTH_ENABLED=false`.
+
+**Local issuer contract (backend).** New `utils/other/local_auth_issuer.py`
+and `routers/local_auth.py`, mounted at `/_local/auth` beside the
+`/_local/storage` mount (`main.py:110-113`). `cryptography` and `PyJWT` are
+already in `backend/requirements.txt` and `backend/pusher/requirements.txt`.
+
+- **Gate.** The router mounts only when `OMI_LOCAL_AUTH_SIGNING_KEY_PATH` is
+  set and `utils/env_loader.py::stage_from_env` (81) returns `local` or
+  `offline`. The harness sets those stages (`dev_harness/config.py:402,426`).
+  The fork deploy runs `OMI_ENV_STAGE=dev` ("Runtime settings"). If the path
+  is set under any other stage, or the key file is readable by group or
+  other, `main.py` raises at import, so the task fails its health check
+  instead of serving a token mint. Without the path the route does not exist
+  and answers 404.
+- **`POST /_local/auth/token`**, form-encoded, in the Cognito
+  `/oauth2/token` response shape so the client parses one shape:
+  - `grant_type=urn:omi:local-dev`, `uid` matching `^[A-Za-z0-9._-]{1,128}$`,
+    optional `email`. Returns `access_token`, `refresh_token`,
+    `expires_in: 3600`, `token_type: Bearer`, plus `uid` and `email`.
+  - `grant_type=refresh_token`, `refresh_token`. Returns a new access token.
+  - Any other grant, a malformed uid, or a refresh token that fails
+    verification answers 400 `{"error": "invalid_grant"}`, the code Cognito
+    sends for a revoked or expired refresh token.
+- **Tokens.** RS256, signed with the key at the path. The access token has
+  `iss: urn:omi:local-dev-issuer`, `token_use: access`,
+  `client_id: omi-local-dev`, `sub: <uid>` and a one-hour `exp`. The refresh
+  token is a JWT with `token_use: refresh` and a 30-day `exp`, so the issuer
+  holds no state and works across processes. `verify_token` refuses it as a
+  bearer token because `token_use` is not `access`.
+- **Verifier.** `verify_token` reads the unverified `iss`. The pool issuer
+  takes the Cognito path. `urn:omi:local-dev-issuer` is accepted only while
+  the same gate holds, against the public half of the configured key, so it
+  never fetches a key set and never raises `AuthProviderUnavailable`. Under
+  any other stage a local-issuer token is `AuthCredentialInvalid`. Every
+  failure goes through the "Verification failures" mapping unchanged.
+- **Route policy.** The router is not mounted under the hermetic environment
+  that `scripts/route_policy_inventory.py` builds (it never sets the key path),
+  so it needs no manifest entry. The `/v1/auth/local-dev/custom-token` entry
+  (`route_policy_manifest.yaml:3560`) is deleted with that route.
+
+**Client gateway.** New `services/auth/local_issuer_gateway.dart`,
+`LocalIssuerAuthSessionGateway implements AuthSessionGateway`:
+
+- `signInLocalDev({required String uid, String? email})` runs the
+  `urn:omi:local-dev` grant against `${Env.apiBaseUrl}_local/auth/token` and
+  stores the session like the Cognito gateway does. `signIn()` calls it with
+  the default uid `local-dev-user`. The uid and email come from the response
+  body. The gateway never parses the access token, so a fixture server may
+  issue opaque tokens.
+- `forceRefresh()` runs the refresh grant. Its failures follow "Refresh
+  failures" below, so `invalid_grant` is terminal.
+- `signOut()` wipes local state. There is nothing to revoke.
+- **Selection.** A new define, `OMI_AUTH_GATEWAY`, takes `cognito` (the
+  default) or `local_issuer`. The profile cannot select it: the fork's own dev
+  build is a `dev` flavor, `AppEnvironmentProfile.forFlavor` gives that the
+  `local_dev` profile when `OMI_APP_PROFILE` is unset (`environment_profile.dart:56-59`),
+  and `Env.validateProfilePairing` (`env.dart:156`) requires `local_dev` for
+  every non-prod flavor. `validateProfilePairing` also refuses `local_issuer`
+  unless the flavor is `dev`, the profile is `local_dev` and the API host is a
+  loopback or private IPv4 literal (`PhysicalQualification.isPrivateLiteral`,
+  113, plus loopback).
+- `AuthProvider.isLocalDevProfile` (`auth_provider.dart:208`) becomes
+  `usesLocalIssuer` (`Env.authGateway == local_issuer`). Keyed on the profile,
+  it would hide the hosted-UI button in the fork's own dev build.
+  `pages/onboarding/auth.dart:54,89` show the hosted-UI button when it is
+  false, and 122-130 show the local-development button when it is true.
+  `onLocalDevSignIn` calls `signInLocalDev()`.
+- `installLocalHarnessTokenGateway(AuthTokenGateway)` (`auth_service.dart:136`)
+  keeps its signature and both assertions. It wraps the fake in a private
+  adapter: `userChanges()` emits `currentUser` once, `tokenChanges()` never
+  emits, `restore()` does nothing and `signIn()` throws `UnsupportedError`.
+
+**Refresh failures.** New `services/auth/auth_refresh_exception.dart`:
+`AuthRefreshException(String code, {required bool terminal})`. Both gateways
+throw it from `forceRefresh()`:
+
+| Refresh response | `code` | `terminal` |
+| --- | --- | --- |
+| 400 or 401 with an RFC 6749 §5.2 `error` body (`invalid_grant`, `invalid_client`, `unauthorized_client`, `invalid_request`, `unsupported_grant_type`) | that `error` value | true |
+| 429 or any 5xx | `http_<status>` | false |
+| socket or TLS error | `network_error` | false |
+| a body that is not the expected JSON | `malformed_response` | false |
+
+A timeout keeps today's `TimeoutException` path (`refresh_timeout`).
+`AuthService.refreshIdToken` replaces `on FirebaseAuthException` (578-586)
+with `on AuthRefreshException`: terminal clears cached auth and returns
+`AuthTokenTerminalFailure(code)`, transient returns
+`AuthTokenTransientFailure(failureClass: 'refresh_transient', code)`.
+`_terminalTokenErrorCodes` (156) is deleted. The telemetry value
+`firebase_transient` becomes `refresh_transient`; whether any dashboard keys
+on the old value is UNVERIFIED.
+
+`_scheduleLocalDevRecovery` (453-480) and its call in `getIdToken` (423) are
+deleted. It worked around `forceRefresh` hanging against the Auth emulator by
+minting a new session instead. Against the local issuer a refresh is a grant
+on the same backend that would mint, so the re-mint adds no path the refresh
+lacks. A transient failure now behaves as in production: the caller gets
+`null` and the next request refreshes again.
+
+**Physical qualification.** The fixture server is the whole backend in this
+lane and stays stdlib-only:
+
+- `server.py` implements `POST /_local/auth/token` for the fixture uid only
+  (any other uid answers 400 `invalid_grant`). It issues opaque access and
+  refresh tokens from `secrets.token_urlsafe(32)` and keeps them in memory.
+  `authenticated()` compares the bearer value with `hmac.compare_digest`
+  against the issued access tokens. `custom_token`, `emulator_opener`, the
+  `/v1/auth/local-dev/custom-token` branch, `--auth-port` (435), `auth_url`
+  (441) and the manifest's `auth_emulator_url` (451, 462) are deleted.
+- `main.dart:350-359` reads the restored principal from the gateway's
+  `currentUser` instead of `FirebaseAuth.instance.currentUser`, keeps the
+  different-principal refusal, and calls
+  `signInLocalDev(uid: PhysicalQualification.fixtureUid)` inside the same
+  `fixture_signin` stage.
+- `PhysicalQualification.install` (126-158) drops the emulator host from the
+  private-literal check (137) and the HTTP allowlist (146), so the allowlist
+  holds only the API host. It drops the three native Firebase flags from the
+  isolation check (152-154) and keeps the bundle-id check. It also requires
+  `Env.authGateway == local_issuer`. `ios/Runner/AppDelegate.swift:302-304`
+  stops reporting the flags, and `ios/test/check_userdefaults_plist_values.py:17-19`
+  follows.
+- `physical_capture_build.py` sets `OMI_AUTH_GATEWAY=local_issuer` and drops
+  `--auth-host`/`--auth-port` (173-174), `private_host(args.auth_host)` (192),
+  the Firebase and `OmiPhysicalAuthEmulator*` plist keys (257-263, which no
+  native code reads), the emulator defines (283-284) and the two `firebase_*`
+  entries of `EXCLUDED_PLUGINS` (23-24), whose packages no longer exist.
+- `physical_capture_collect.py` (185, 458) and `physical_capture_verify.py`
+  (107) drop `auth_emulator_url` from the run manifest. The fixtures in
+  `physical_capture_test.py:31` and `physical_capture_collect_test.py:32,63`
+  follow, as do `physical_capture.md`, `PHYSICAL_CAPTURE_BUILD.md` and
+  `physical_capture_fixtures/README.md`.
+
+**Hermetic journeys.**
+
+- `hermetic_boot.dart` drops its `firebase_auth` import (4). `_SyntheticGateway`
+  and `ScriptableGateway` still implement `AuthTokenGateway` and install
+  through the unchanged seam. `ScriptableGateway` throws
+  `AuthRefreshException(code, terminal: true)` for a terminal outcome and
+  `AuthRefreshException('network_error', terminal: false)` for a transient
+  one. Its doc comment (166-169) names the gateway contract, not Firebase.
+- j4's terminal leg scripts `invalid_grant` instead of `user-token-expired`
+  (71) and keeps its assertions: the session expires and the next request is
+  blocked. The re-mint leg (34-63) becomes "a transient refresh failure
+  returns `null` without expiring the session, and the next request refreshes
+  and succeeds". The negative test (99-116) becomes "a transient failure
+  never expires the session on any profile", because no profile re-mints.
+- `support/fixture_backend.dart:187-192` drops the custom-token case.
+- `journeys/README.md` j4 row (35) and boundary row (60) describe the
+  gateway contract, and its lane note (65) says the simulator lane uses the
+  local issuer. `run_journeys.sh:14` says the same.
+- `test/unit/local_dev_session_recovery_test.dart` and
+  `test/unit/auth_service_local_dev_test.dart` are deleted with the recovery
+  and `signInWithLocalDevToken`.
+
+**Simulator lane and session harness.** The simulator lane stays, with the
+local issuer in place of the Auth emulator. The Firestore emulator in this
+lane is a data-store question, owned by the document-store adapter card, and
+is out of scope here.
+
+- `dev_harness/config.py:368-372` drops `FIREBASE_AUTH_EMULATOR_HOST`,
+  `FIREBASE_AUTH_PROJECT_ID` and `FIREBASE_API_KEY` and sets
+  `OMI_LOCAL_AUTH_SIGNING_KEY_PATH`. `dev-up` writes a fresh RSA-2048 key at
+  `<state_root>/services/auth/local-issuer.pem` with mode 0600. `AUTH_PORT`
+  (15) and `LOCAL_FIREBASE_API_KEY` (26) go.
+- `cli.py`: `_firebase_command` (664-684) configures only the Firestore
+  emulator, the doctor's Java and Node checks (362-383) name only Firestore,
+  and the status line (433) prints the issuer URL.
+- `mobile_fixtures.py`: `LOCAL_DEV_CUSTOM_TOKEN_PATH` (28) becomes
+  `LOCAL_AUTH_TOKEN_PATH = "/_local/auth/token"`, and `seed_synthetic_user`
+  (113) runs the `urn:omi:local-dev` grant. Its receipt keeps the same fields
+  and still never records a token. `tests/test_mobile_fixtures.py` follows.
+- `mobile_session.py:825` and `session_evidence.py:313` replace
+  `auth_emulator_host` with `auth_issuer_url`, which must be loopback. That
+  changes a required field of `contracts/session/session-evidence-v1.schema.json`
+  (164-167), so the change publishes `session-evidence-v2.schema.json` and
+  moves every file that names v1 to it (`git grep -l session-evidence-v1`).
+  Which of those read the endpoints block is UNVERIFIED.
+  `tests/test_session_evidence.py`, `tests/test_mobile_session.py`,
+  `tests/test_cli.py`, `tests/test_env_stage.py` and
+  `tests/spine/test_live_session.py:80` follow.
+- `memory_scenarios.py`: the `auth` seed operations (`_auth_seed`, 190) go.
+  The issuer accepts the scenario's own uids, so `_resolve_auth_uid_map`
+  (1011) becomes the identity map and `_lookup_auth_uid` (995) is deleted.
+  `canonical-auth-uids.json` is still written, so
+  `backend/config/chat_first_e2e_fixture.py` and `chat-first-e2e-fixture.sh`
+  keep reading it. The script gets its token from the `urn:omi:local-dev`
+  grant instead of `accounts:signInWithPassword`.
+- `backend/testing/referral_campaign` verifies the app's real token (its
+  `server.py:14` refuses to start without both emulators). It requires
+  `OMI_LOCAL_AUTH_SIGNING_KEY_PATH` in place of the Auth emulator.
+  `replay_harness_phase0a/runner.py:143` and `sync_cloud_tasks_stack/run.py:272`
+  authenticate with `ADMIN_KEY` and set the emulator variable only to start
+  `firebase_admin` offline, so they drop it.
+
+**Every Auth-emulator owner.** `git grep -il "auth emulator\|FIREBASE_AUTH_EMULATOR\|firebaseAuthEmulator\|local-dev/custom-token\|signInWithLocalDevToken\|auth_emulator"`
+outside `desktop/` and these ADR files lists 64 files on `a04153d180`. Each
+one has a port above or one of these dispositions:
+
+| Owner | Disposition |
+| --- | --- |
+| `backend/main.py:87-99`, `backend/desktop_backend.py:59-64` | The emulator branch goes with `firebase_admin.initialize_app` ("Auth: Cognito access token"). `tests/unit/test_agent_vm_firebase_project_split.py:45` loses its emulator case |
+| `backend/utils/env_loader.py:121-140,188` | `_skip_env_key_for_auth_emulator` and the credential pop are deleted. `tests/unit/test_env_loader.py` drops those cases |
+| `backend/routers/auth.py:1271-1340` (`local_dev_custom_token`) | Deleted, with `tests/unit/test_local_dev_auth.py`. The rest of the router is cut by `OMI_DISABLED_ROUTERS=auth` |
+| `app/setup.sh:335,578`, `app/setup/scripts/setup.ps1:133`, `app/scripts/profile_flutter_android.sh:141` | Pass `--dart-define=OMI_AUTH_GATEWAY=local_issuer` instead of the emulator host |
+| `app/README.md:30,147`, `docs/doc/developer/AppSetup.mdx`, `docs/doc/developer/backend/Backend_Setup.mdx`, `backend/docs/runbooks/local-emulator-manual-qa.md`, `scripts/dev-harness/MEMORY_SCENARIOS.md`, `MOBILE_SESSIONS.md` | Describe the local issuer. The upstream-facing developer docs change only on the fork branch |
+| `app/lib/startup_auth.dart:10`, `test/unit/auth_refresh_timeout_test.dart:15`, `test/unit/startup_auth_timeout_test.dart:10` | Comments that cite the emulator measurement behind the 8 s refresh ceiling. The ceiling stays, and the comments say "token refresh" |
+| `app/integration_test/ios_auth_refresh_canary_test.dart:13,38,42,46` | Reason strings say "persisted session" and "forced refresh" instead of Firebase |
+| `app/ios/Runner/SiriIntegration/SiriDebugProbe.swift` | Covered in "iOS Siri (native)" |
+| `scripts/dev-harness/dev_harness/desktop_profile.py`, `desktop-run-local.sh`, `verify-desktop-local-launch.sh`, `tests/test_desktop_profile.py`, and the `dev-desktop`, `dev-verify` and `desktop-run-local` Makefile targets | Deleted. The desktop apps are outside the fork's MVP, and `desktop_profile.py` reads the emulator host that `config.py` no longer has. `desktop/` itself is not built by the fork and is untouched |
+| `backend/scripts/firebase_release_probe_token.py`, `smoke_mcp_chatgpt_review.py`, `sync_firebase_google_provider_secret.py` and their tests | Upstream release and ops tooling against Firebase projects. Not run by the fork and not imported by the serving path. Left unchanged; `firebase-admin` stays installed |
+
+**Tests and acceptance (auth card).**
+
+1. Backend unit tests for the issuer: both grants return the Cognito response
+   shape. A bad grant, a malformed uid, a refresh token with a bad signature
+   and an access token presented as a refresh token each answer 400
+   `invalid_grant`. The router is absent without the key path. Import raises
+   with the key path under `OMI_ENV_STAGE=dev` and with a mode-0644 key.
+2. `test_auth_tokens.py` gains: a local-issuer token verifies under
+   `local`/`offline` with the key path; the same token is
+   `AuthCredentialInvalid` under `dev` and without the key path; a local
+   refresh token is `AuthCredentialInvalid` as a bearer token.
+3. App unit tests: `local_issuer_gateway_test.dart` covers both grants and
+   every row of the refresh-failure table. `env_test.dart` covers
+   `validateProfilePairing` refusing `local_issuer` with the prod flavor and
+   with a public API host. `auth_service_token_result_test.dart` asserts
+   terminal and transient `AuthRefreshException` map to
+   `AuthTokenTerminalFailure` and `AuthTokenTransientFailure`.
+4. `bash integration_test/journeys/run_journeys.sh` passes all five journeys
+   and their negatives on the hermetic lane, and the simulator lane passes
+   against `make dev-up`.
+5. `python3 app/tool/perf_shell.py --check` passes.
+6. `python3 -m pytest scripts/dev-harness/physical_capture_test.py
+   scripts/dev-harness/physical_capture_collect_test.py
+   scripts/dev-harness/tests` passes.
+7. Physical qualification compiles: `physical_capture_build.py --prepare-only`
+   succeeds, and `flutter build ios --flavor dev --profile` with
+   `OMI_PHYSICAL_QUALIFICATION=true` and `OMI_AUTH_GATEWAY=local_issuer`
+   succeeds. A device run reaches the `fixture_signin` and `resolve_auth`
+   stages against the fixture server.
+8. The grep at the top of this table returns only the excluded paths, and
+   check 1 of "Client: Firebase retirement" still returns nothing.
 
 ### STT: Amazon Transcribe streaming
 
@@ -1583,7 +2003,8 @@ method is still mounted on the same path.
 
 | Feature | Switch | Disabled behaviour | Client result |
 | --- | --- | --- | --- |
-| Firebase sign-in (`/v1/auth/*`) | `OMI_DISABLED_ROUTERS=auth` | 404 on `/v1/auth/authorize`, `/callback/*`, `/token`, `/local-dev/custom-token` | Never called. The app uses the Cognito hosted UI. `oauth` stays mounted for MCP |
+| Firebase sign-in (`/v1/auth/*`) | `OMI_DISABLED_ROUTERS=auth` | 404 on `/v1/auth/authorize`, `/callback/*`, `/token`, `/local-dev/custom-token` | Never called. The app uses the Cognito hosted UI. Local and test sign-in use the paths in "Client: non-production auth paths" |
+| Firebase-JS consent pages: app-integration OAuth (`routers/oauth.py`) and MCP OAuth authorize (`routers/mcp_sse.py:193`, `:219`) | `OMI_DISABLED_ROUTERS=oauth`, plus `OMI_DISABLED_ROUTES=GET /authorize;POST /authorize` | 404 on `GET /v1/oauth/authorize`, `POST /v1/oauth/token`, `GET /authorize` and `POST /authorize` | Never called by the app. Third-party app OAuth needs the cut app store. MCP clients keep MCP API keys (`/v1/mcp` stays mounted); MCP OAuth sign-in returns with a Cognito consent page later |
 | Stripe billing | `OMI_DISABLED_ROUTERS=payment,retention_offer,yearly_switch,redeem_code,storefront`, plus `STRIPE_API_KEY` and `STRIPE_*_PRICE_ID` unset | 404 on `/v1/payments/*`, `/v1/stripe/*`, `/v1/payment-methods/*` | `GET /v1/users/me/subscription` stays mounted and returns the seeded `unlimited` plan without calling Stripe. `showSubscriptionUI` is false, so the paywall never opens |
 | Plugins / app store | `OMI_DISABLED_ROUTERS=apps,developer,developer_key` | 404 on `/v1/apps*`, `/v2/apps*` | Conversation detail keeps its cached summary templates (`SummaryTemplatesLoad.failed`) |
 | Typesense search | `OMI_DISABLED_ROUTES=POST /v1/conversations/search`, plus `TYPESENSE_HOST` and `TYPESENSE_API_KEY` unset | 404 | Search returns `ConversationSearchResult.failure` (`app/lib/backend/http/api/conversations.dart:1312`). With the env vars unset, `utils/conversations/typesense_index.py` skips index writes |
@@ -1681,8 +2102,8 @@ described above until updated.
 **Full switch values for the fork:**
 
 ```text
-OMI_DISABLED_ROUTERS=auth,payment,retention_offer,yearly_switch,redeem_code,storefront,apps,developer,developer_key,phone_calls,messaging,tts,google_calendar,calendar_onboarding,calendar_meetings,x_connector,review,dream_cohort,dream_report,static_map,frame_requests,screen_frames
-OMI_DISABLED_ROUTES=POST /v1/users/fcm-token;POST /v1/conversations/search;POST /v2/sync-capture-manifest;POST /v1/sync-local-files;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id};POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream;GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability;GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url;POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link
+OMI_DISABLED_ROUTERS=auth,oauth,payment,retention_offer,yearly_switch,redeem_code,storefront,apps,developer,developer_key,phone_calls,messaging,tts,google_calendar,calendar_onboarding,calendar_meetings,x_connector,review,dream_cohort,dream_report,static_map,frame_requests,screen_frames
+OMI_DISABLED_ROUTES=GET /authorize;POST /authorize;POST /v1/users/fcm-token;POST /v1/conversations/search;POST /v2/sync-capture-manifest;POST /v1/sync-local-files;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id};POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream;GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability;GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url;POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link
 ```
 
 Every module name is a `Mount(...)` in `ROUTER_MOUNTS`, and every route entry
@@ -1705,7 +2126,7 @@ values above and asserts:
    [cut table](MVP-API-SURFACE.md#cut-routes-and-their-switches) is absent from
    `app.router.routes`.
 2. Every route the census marks **in** is still present.
-3. No route whose path starts with a cut prefix (`/v1/auth/`, `/v1/payments/`,
+3. No route whose path starts with a cut prefix (`/v1/auth/`, `/v1/oauth/`, `/v1/payments/`,
    `/v1/stripe/`, `/v1/apps`, `/v2/apps`, `/v1/phone/`, `/v1/messaging/`,
    `/v2/tts/`, `/v1/calendar/`, `/v1/x/`, `/v1/review/`, `/v2/review/`,
    `/v1/entities`, `/v1/dream/`, `/v1/frame-requests`, `/v1/static-map`)
