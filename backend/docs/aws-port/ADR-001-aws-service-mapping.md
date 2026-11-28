@@ -64,7 +64,7 @@ whether `database/ports/` or `database/cells/` already provides the seam.
 | Cloud Tasks (durable listen-finalization dispatch) | A new `LISTEN_FINALIZATION_DISPATCH_MODE=in_process` mode: a bounded asyncio dispatcher in the backend container runs the existing worker handler. The durable job rows and the existing startup and periodic reconcilers are the recovery owner (see "Durable finalization") | SQS plus an in-task consumer (extra queue, DLQ and IAM, but the consumer dies with the same task, so it protects nothing the durable rows do not). Inline pusher dispatch (disables every durable recovery path). Step Functions (a workflow engine for a single wake message). Lambda workers (15-minute limit is below the 1500 s dispatch deadline plus retries) | `utils/cloud_tasks.py` `is_listen_finalization_dispatch_enabled` (328), `is_listen_finalization_dispatch_configured` (341), `is_listen_finalization_tasks_configured` (346), `enqueue_listen_finalization_job` (649); `routers/conversation_finalization.py::run_listen_finalization_job` (106) | No |
 | Memorystore / Redis Cloud | ElastiCache for Valkey, node-based, `cache.t4g.micro`, cluster mode disabled | ElastiCache Serverless (cluster-mode only; the code uses 19 `r.eval`, 12 `register_script`, 6 pipelines and 2 `mget`, which risk CROSSSLOT) | `database/redis_connection.py` gains `redis_tls_kwargs()` and a `REDIS_DB_TLS` switch, and every production constructor routes through it (see "Valkey: TLS on every client") | No |
 | Soniox / Modulate streaming STT | Amazon Transcribe streaming over a raw SigV4 WebSocket on Python 3.11, as a new `transcribe` provider and `TranscribeStreamingSocket(STTSocket)` | Self-hosted Parakeet on GPU (GPU cost floor for one user) | The closed STT policy seams listed under "STT: seam contract" | No |
-| OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `bedrock` provider), `utils/llm/clients.py::get_llm` (762), `utils/llm/model_config.py` (new `MODEL_QOS` profile) | No |
+| OpenAI / OpenRouter / Anthropic LLMs | Amazon Bedrock through `langchain-aws` `ChatBedrockConverse`, `au.` inference profiles | Bedrock's OpenAI-compatible endpoint (serves gpt-oss only, no Claude) | `utils/llm/providers.py` (new `get_or_create_bedrock_llm`), `utils/llm/clients.py::get_llm` (762, explicit `bedrock` dispatch before the managed gateway branch at 915), `utils/llm/request_options.py` (new, bind-time options), `utils/llm/model_config.py` (new `aws` `MODEL_QOS` profile). Direct gateway callsites are ported or cut in "LLM: Bedrock through `langchain-aws`" | No |
 | OpenAI embeddings | Bedrock `amazon.titan-embed-text-v2:0` (1024-dim) via `BedrockEmbeddings`, behind a Titan input fitter that retries on Titan's own over-token rejection. No embedding call is made while the vector index is cut (see "Embeddings: Titan input bound and the cut index") | Cohere Embed on Bedrock (no gain at this scale, one more model to approve) | `utils/llm/clients.py::_OpenAIEmbeddingsProxy` (356) and `generate_embedding` (1076); `utils/conversations/process_conversation.py::save_structured_vector` (2175) | No |
 | OpenAI Files (chat attachments) | S3 `BUCKET_CHAT_FILES` for the bytes, sent to Bedrock Converse as image and document content blocks, with upload admission narrowed to what Converse accepts (see "Attach contract") | Keeping OpenAI Files (not an AWS service, and a second LLM vendor for one feature) | `utils/other/chat_file.py` `FileChatTool.upload` (262), `upload_video`, `_ask_files_stream` (397), `_ask_files` (462), `download_owned_chat_file` (115); `models/chat.py` `chat_file_is_document` | No |
 | Gemini / ElevenLabs TTS (`/v2/tts/synthesize`) | Cut for MVP. Amazon Polly later | Polly now (the client already falls back to the system voice) | `routers/tts.py` | No |
@@ -244,7 +244,7 @@ exception:
 | `get_current_user_uid_from_ws_message` (583), with `_verify_user_uid_from_ws_message` (545) | `WS /v4/web/listen` (`routers/transcribe.py:246`, the web app, not the Flutter app) | Translates the verifier's types into `WebSocketException` the same way. `routers/transcribe.py` drops its `except InvalidIdTokenError` clause (281). Its existing `except WebSocketException` (285) then sends `auth_response: false` and closes with the mapped code. Format errors stay `ValueError` → 1008 |
 | `routers/firmware.py::_verified_uid` (347) | `GET /v2/firmware/latest` | Fail-soft as today: any failure returns no uid and the release allowlist does not match. It logs `AuthProviderUnavailable` at warning, so a JWKS outage is visible |
 | `utils/support_auth.py::get_support_caller_uid` (11) | `/v1/support/*` (not reached by the app) | Calls `verify_token` instead of `auth.verify_id_token`, then `http_auth_exception` (401 or 503) |
-| `routers/public_shared_conversation_chat.py` (100-114) | `POST /v1/conversations/shared/chat` with `X-Omi-User-Id-Token` (the web share page, not the Flutter app) | `run_blocking(critical_executor, verify_token, ...)`. A credential error keeps the 401 `invalid_token` body. `AuthProviderUnavailable` and saturation answer 503 `auth_provider_unavailable` instead of the bare `except Exception` → 401 |
+| `routers/public_shared_conversation_chat.py` (100-114) | `POST /v1/conversations/shared/chat` with `X-Omi-User-Id-Token` (the web share page, not the Flutter app) | `run_blocking(critical_executor, verify_token, ...)`. A credential error keeps the 401 `invalid_token` body. `AuthProviderUnavailable` and saturation answer 503 `auth_provider_unavailable` instead of the bare `except Exception` → 401. The router is cut in the MVP (`OMI_DISABLED_ROUTERS=public_shared_conversation_chat`, see "Cut switches"), so this mapping applies only when it is re-enabled |
 | `routers/oauth.py::oauth_token` (165) and `utils/mcp_server/oauth.py::mcp_authorize_consent` (307) | browser pages that sign in with the Firebase JS SDK (`templates/oauth_authenticate.html`, `templates/mcp_oauth_authorize.html:9-12`) and post a `firebase_id_token` | Cut: `OMI_DISABLED_ROUTERS=oauth` and `OMI_DISABLED_ROUTES=GET /authorize;POST /authorize` (see "Cut switches"). Without Firebase those pages cannot produce a token. A Cognito hosted-UI consent page is follow-up work |
 | `routers/apps.py:1864` (`POST /v1/apps/migrate-owner`) | anonymous-account migration | Cut with the `apps` router. The pool has no anonymous users |
 | `routers/auth.py` | Firebase sign-in | Cut with the `auth` router |
@@ -453,8 +453,8 @@ field. The members:
 | Member | Contract |
 | --- | --- |
 | `AuthUserSnapshot? get currentUser` | Synchronous, from the in-memory session. `uid` is the Cognito `sub` |
-| `Stream<AuthUserSnapshot?> userChanges()` | Emits on sign-in, sign-out and account switch. Replaces `authStateChanges()` |
-| `Stream<RefreshedAuthToken> tokenChanges()` | Emits after each refresh. Replaces `idTokenChanges()` |
+| `Stream<AuthUserSnapshot?> userChanges()` | The owner-transition stream. Each subscription first receives the current owner (`currentUser`, possibly `null`), then every transition: `restore()` completing, sign-in, sign-out, account switch, and a terminal refresh failure (`null`). Like Firebase's `authStateChanges()`, it replays on listen, so a listener attached after a cold restore still sees the owner. Replaces `authStateChanges()` and the UID-distinct `idTokenChanges()` listener (see "Auth listener migration") |
+| `Stream<AuthTokenRefreshed> tokenChanges()` | Refresh-only, not replayed. Emits after each successful `forceRefresh()` or background refresh, with `ownerUid` (the `sub` the refresh token belongs to) and the new `RefreshedAuthToken`. A grant that completes after the session it started from was signed out or replaced is discarded inside the gateway: no store write and no emission. Siri's token mirror is its only consumer |
 | `Future<RefreshedAuthToken?> forceRefresh()` | Refresh-token grant against `/oauth2/token`. A failed grant throws `AuthRefreshException(code, terminal:)`: token-endpoint error `invalid_grant`, `invalid_client` or `unauthorized_client` is terminal, and HTTP 429, 5xx, a timeout, a socket error or an unparseable body is transient (see "Refresh failures" in "Client: non-production auth paths") |
 | `Future<void> restore()` | Reads the stored session from `flutter_secure_storage`. No network |
 | `Future<AuthSignInResult> signIn()` | Hosted UI authorization code with PKCE. `AuthSignInResult` holds the snapshot and an `isNewUser` flag, replacing `UserCredential` |
@@ -477,7 +477,8 @@ in the private `_TokenOnlySessionAdapter`:
 
 - `currentUser`, `forceRefresh()` and `signOut()` delegate to the wrapped
   gateway.
-- `userChanges()` emits `currentUser` once. `tokenChanges()` never emits.
+- `userChanges()` emits `currentUser` on each listen, then nothing.
+  `tokenChanges()` never emits.
 - `restore()` does nothing.
 - `signIn()` and `updateDisplayName()` throw `UnsupportedError`. No token-only
   caller reaches them today.
@@ -531,10 +532,10 @@ migration and link paths (`auth_provider.dart` lines 30-48, `auth_service.dart`
 | `services/auth_service.dart` | 513-580 `refreshIdToken` | Becomes `forceRefresh()` |
 | `services/auth_service.dart` | 993, 1024 | Display-name update. Becomes `updateDisplayName` |
 | `providers/auth_provider.dart` | 50, 80, 99, 187, 190 | Signed-in and owner checks |
-| `providers/auth_provider.dart` | 116 `authStateChanges`, 141 and 144 `idTokenChanges` | Become `userChanges()` and `tokenChanges()` |
+| `providers/auth_provider.dart` | 116 `authStateChanges`, 141 and 144 `idTokenChanges` | 116 and 144 move onto `userChanges()`. The Siri-only listener at 141 is split between `userChanges()` and `tokenChanges()`. See "Auth listener migration" |
 | `providers/auth_provider.dart` | 236, 268, 311-343 | `UserCredential` sign-in flow. Becomes `AuthSignInResult` |
-| `services/onboarding_sync_runtime.dart` | 34 | Auth listener that wakes onboarding sync |
-| `services/on_device/on_device_background.dart` | 35, 49 | Owner check and auth listener for background work |
+| `services/onboarding_sync_runtime.dart` | 34 | Auth listener that wakes onboarding sync. Moves to `AuthService.instance.userChanges()`, whose replay keeps the wake on listen that `authStateChanges()` gives today |
+| `services/on_device/on_device_background.dart` | 35, 49 | Owner check and auth listener for background work. 49 moves to `userChanges()`; its subscription type becomes `StreamSubscription<AuthUserSnapshot?>` |
 | `services/siri_integration.dart` | 1051 | Owner check before opening a Siri result |
 | `services/telemetry/client_telemetry_transport.dart` | 18, 33 | Telemetry owner id and token |
 | `pages/chat/widgets/content_blocks/edit_receipt_block.dart` | 253, 258 | Owner check for receipt undo |
@@ -544,6 +545,65 @@ migration and link paths (`auth_provider.dart` lines 30-48, `auth_service.dart`
 | `pages/onboarding/variants/yinka/yinka_onboarding_flow.dart` | 156-158 | Same |
 | `pages/settings/change_name_widget.dart` | 20 | Firebase `User` field |
 | `utils/auth/sign_in_failure.dart` | 32 | `FirebaseAuthException` mapping. Maps OAuth error codes instead |
+
+**Auth listener migration.** Firebase's `idTokenChanges()` is not only a
+refresh stream. It is a `Stream<User?>` that replays the current user on listen
+and emits on sign-in, sign-out and every refresh. `AuthProvider` relies on all
+three (`providers/auth_provider.dart:116-167`), so its three listeners do not
+map one-to-one onto a refresh-only stream:
+
+| Listener today | What it depends on | Port |
+| --- | --- | --- |
+| 116 `authStateChanges().distinct(uid)` | Replay on listen, sign-in, sign-out (`null`) | `AuthService.instance.userChanges().distinct((p, n) => p?.uid == n?.uid)`. Body unchanged apart from the type: `User?` becomes `AuthUserSnapshot?`, and the `isAnonymous` checks read the snapshot field, which is always false |
+| 144 `idTokenChanges().distinct(uid)`, the owner and token reset | Replay on listen, so a cold restore runs the token check once. A `null` event on sign-out or revocation, which clears `SharedPreferencesUtil().authToken`, `tokenExpirationTime` and `authToken`. The re-authentication path (`_requiresReauthentication`, empty or expired cached token → `getIdToken()`) on each owner change | `userChanges().distinct((p, n) => p?.uid == n?.uid)`, a second subscription with the same body and type change. Every input it needs is an owner transition, which `userChanges()` carries. It never needed refreshes, because `distinct` by uid already dropped them |
+| 141 `idTokenChanges()`, Siri only | Replay on listen and every refresh, to keep the native Keychain mirror current. Its `user` carries the token through `getIdTokenResult()` | Split by event kind. (a) Owner transitions, including the cold-restore replay, already reach Siri through the 116 listener: `SiriIntegration.accountChanged(user)` (`siri_integration.dart:527`, now taking `AuthUserSnapshot?`) ends in `refreshSession(user, AuthService.instance.currentAccessToken)` at 575 for a non-null owner, so the mirror is published without waiting for a refresh. (b) Refreshes: the 141 subscription becomes `tokenChanges().listen(...)`, which calls `refreshSession(AuthService.instance.currentUser!, event.token)` only when `event.ownerUid == AuthService.instance.currentUser?.uid`, and otherwise drops the event |
+
+- `AuthTokenRefreshed` is a new value type beside `RefreshedAuthToken` in
+  `services/auth/auth_token_result.dart`:
+  `AuthTokenRefreshed({required String ownerUid, required RefreshedAuthToken token})`.
+  `RefreshedAuthToken` and the `forceRefresh()` return type stay unchanged,
+  so `AuthTokenGateway` and its 25 fakes do not change.
+- `AuthService.currentAccessToken` returns the cached `RefreshedAuthToken` of
+  the current session, or `null`. It reads the gateway's in-memory session and
+  does no network call.
+- Late refreshes are fenced twice. Inside `CognitoAuthSessionGateway`, each
+  grant captures the session epoch it started from, and a response that
+  arrives after `signOut()` or a new `signIn()` bumped the epoch is discarded
+  before it is stored or emitted. In Dart, the Siri listener compares
+  `ownerUid`, and `SiriIntegration.refreshSession` keeps its own
+  `_accountGeneration` and `_uid` checks (`siri_integration.dart:707-740`).
+- A terminal refresh failure clears the session in the gateway and emits
+  `null` on `userChanges()`, as Firebase emits `null` on revocation today.
+  `AuthService.sessionExpiredEvents` still fires, so the 168-180 listener
+  keeps its reauthentication prompt.
+- `AuthService.handleAuthUserChanged(uid)` (384) is still called from both
+  owner listeners, so `_invalidateRefreshes` bumps `_sessionGeneration` on
+  every owner change, as it does today.
+
+**Tests (`test/unit/auth_listener_migration_test.dart`).** A fake
+`AuthSessionGateway` with a broadcast controller per stream:
+
+1. **Cold restore before listener attachment.** `restore()` completes with
+   owner `A` before `AuthProvider` subscribes. On subscription, both owner
+   listeners run once with `A`, the token check calls `getIdToken()` when the
+   cached token is empty, and Siri's `refreshSession` receives `A` and the
+   restored token, with no refresh event emitted.
+2. **Sign-out without refresh.** With owner `A` signed in, `signOut()` emits
+   `null` on `userChanges()` and nothing on `tokenChanges()`. The test asserts
+   that `SharedPreferencesUtil().authToken` is empty,
+   `tokenExpirationTime == 0`, `authToken` is `null`, and
+   `SiriIntegration.accountChanged(null)` ran.
+3. **A previous owner's late refresh.** A refresh starts for `A`, then the
+   user switches to `B`. The fake completes `A`'s grant after the switch. The
+   gateway test asserts nothing is stored or emitted. The provider test
+   injects a stale `AuthTokenRefreshed(ownerUid: 'A', ...)` directly and
+   asserts that Siri's mirror still holds `B`'s token.
+4. **Refresh for the current owner.** A refresh for `B` calls
+   `refreshSession` once with the new token. Neither owner listener runs and
+   `handleAuthUserChanged` is not called.
+5. `onboarding_sync_runtime` and `on_device_background` receive the replayed
+   owner on subscription, and `on_device_background` cancels its runner when
+   `userChanges()` emits a different uid.
 
 ### Client: Firebase retirement
 
@@ -661,13 +721,14 @@ auth state (`SiriBridge.swift:262-300`). The census keeps Siri App Intents in
 the MVP, so the native owner check moves onto the session mirror that Dart
 already publishes (`siri_integration.dart:707-742`, `publishSessionConfig`):
 
-- `refreshSession` takes an `AuthUserSnapshot` and the access token from
-  `tokenChanges()` in place of the Firebase `User` and `IdTokenResult`. It runs
-  on every emission, so the Keychain mirror always holds the newest access
-  token and its `exp`. Its two callers move with it: `auth_provider.dart:142`
-  (the `idTokenChanges` listener, now `tokenChanges()`) and
+- `refreshSession` takes an `AuthUserSnapshot` and a `RefreshedAuthToken` in
+  place of the Firebase `User` and its `getIdTokenResult()`. It runs on every
+  owner transition and on every current-owner refresh, so the Keychain mirror
+  always holds the newest access token and its `exp`. Its callers move with
+  it: `auth_provider.dart:141-143`, which becomes the `userChanges()` plus
+  owner-checked `tokenChanges()` pair in "Auth listener migration", and
   `siri_integration.dart:575`, which passes `AuthService.instance.currentUser`
-  and the current access token.
+  and `AuthService.instance.currentAccessToken`.
 - `requireFirebaseOwner` becomes `requireMirroredOwner(uid)`: the current
   config's uid must equal `uid` and the mirrored token must exist. It keeps the
   protected-data branch (`setAuthResolutionPending`).
@@ -1206,13 +1267,224 @@ requirement files, run `backend/scripts/update-python-lock.sh`. It regenerates
   `conv_structure`, and `au.anthropic.claude-haiku-4-5-20251001-v1:0` for the
   other features. The `au.` profiles keep inference in Australian regions. The
   task role allows only `au.*` profiles and denies `global.*`.
-- **Agent loop fit.** `utils/retrieval/agentic.py::_run_openai_agent_stream`
-  calls `get_llm('chat_agent')` and reads `tool_call_chunks`, which
-  `ChatBedrockConverse` emits. Strip OpenAI-only kwargs (for example
-  `stream_options`) in the provider. The `_AnthropicClientProxy` path
-  (`agentic.py` around line 963) switches to `anthropic.AsyncAnthropicBedrock`.
-- **Gateway.** `OMI_LLM_GATEWAY_FEATURE_MODE` stays unset, so features call the
-  model directly.
+- **Anthropic Messages client.** `_AnthropicClientProxy`
+  (`utils/llm/clients.py:276`, used by `agentic.py:963`) switches its default
+  client to `anthropic.AsyncAnthropicBedrock`. It reaches the gateway only when
+  `should_route_chat_agent_through_gateway()` is true (`clients.py:298`), which
+  needs `OMI_LLM_GATEWAY_FEATURE_MODE=gateway`. That variable stays unset.
+
+#### Managed dispatch: Bedrock before the gateway branch
+
+**Today every managed call goes to the gateway, whatever the env says.**
+`get_llm` (`clients.py:762`) computes `route_through_gateway` at 883 from
+`should_route_company_paid_features_through_gateway()`, which returns `True`
+unconditionally (`gateway_client.py:231-239`). The optional
+`OMI_LLM_GATEWAY_FEATURE_MODE` and `OMI_LLM_CHAT_AGENT_ROUTE` settings are
+read only for BYOK (`clients.py:871-880`). A keyless request therefore takes the
+managed branch at 915-923, `get_or_create_omi_gateway_llm(feature_auto_lane_id(feature))`,
+before the direct provider factory at 925-930 is considered. The gateway base
+URL defaults to `http://127.0.0.1:9080` (`gateway_client.py:30`) when
+`OMI_LLM_GATEWAY_URL` is unset. Neither the `backend` nor the `pusher`
+container in the task listens there, so adding an `aws` profile alone leaves
+chat, conversation structure and episode compose failing with a connection
+error. Leaving `OMI_LLM_GATEWAY_FEATURE_MODE` unset changes nothing on that
+path.
+
+**Decision.** `get_llm` dispatches the `bedrock` provider explicitly, right
+after the Anthropic and Perplexity guards (`clients.py:786-793`) and before
+BYOK resolution (810) and the gateway branch:
+
+```python
+model, provider = _get_model_config(feature)
+...  # existing anthropic / perplexity guards
+if provider == 'bedrock':
+    _require_client_budget(feature, uid=uid, provider='bedrock', allow_byok=False)
+    result = get_or_create_bedrock_llm(
+        model, streaming, {'request_timeout': request_timeout, 'max_retries': max_retries}
+    )
+    return result.model_copy(update={'metadata': {**(result.metadata or {}), 'omi_resolved_model': model}})
+```
+
+- `get_or_create_bedrock_llm` lives in `utils/llm/providers.py` beside
+  `get_or_create_openai_compatible_llm` (101). It caches a `ChatBedrockConverse`
+  per (model id, streaming, timeout, retries), with
+  `region_name='ap-southeast-2'` and a `botocore.config.Config` whose
+  `read_timeout` is the feature deadline and whose `retries` is
+  `{'max_attempts': max_retries + 1, 'mode': 'standard'}`.
+- Only the `aws` profile maps a feature to `bedrock`. Every upstream profile
+  keeps its `(model, provider)` pairs, so upstream dispatch, the BYOK branch
+  and the gateway invariant are byte-for-byte unchanged when `MODEL_QOS` is
+  not `aws`. `should_route_company_paid_features_through_gateway` keeps
+  returning `True`.
+- BYOK is not consulted for a `bedrock` feature. The fork has no BYOK users,
+  and a client-supplied key must not switch an AWS-profile request onto a
+  provider the task cannot reach.
+- The prompt-cache binds at the end of `get_llm` (`clients.py:938-948`) are
+  skipped by the early return. They are keyed on OpenAI model names
+  (`supports_prompt_cache`, `uses_explicit_cache_and_chat_sanitizer`,
+  `model_config.py:410-423`) and would not match an `au.anthropic.*` id
+  anyway.
+- `MODEL_QOS` falls back to `premium` with only a warning when the name is not
+  a profile (`model_config.py:182-184`), which would silently put every feature
+  back on the gateway. The port adds a startup check: when `MODEL_QOS=aws` is
+  set and `get_active_profile_name()` is not `aws`, `main.py` and the pusher
+  entrypoint raise.
+
+**Rejected: run `backend/llm_gateway` as a third container with a Bedrock
+upstream adapter.** It keeps the gateway invariant intact, but it adds a
+service, a service token in Secrets Manager and a second hop to every call,
+and the gateway's lanes are OpenAI chat-completions shaped, so Bedrock would
+still need an adapter there. At one user there is no spend ledger to protect.
+
+**Rejected: make `should_route_company_paid_features_through_gateway` return
+`False` under the `aws` profile.** That sends managed calls to
+`get_default_client` (`providers.py:254`), which knows only Gemini and the
+OpenAI-compatible providers, and it weakens the upstream rule that no unset
+flag can send paid traffic direct.
+
+#### Direct gateway callsites
+
+`get_llm` is not the only way onto the gateway. Every backend callsite of a
+gateway client or lane (`git grep -n "get_or_create_omi_gateway_llm\|get_llm_gateway_client\|get_llm_gateway_base_url\|invoke_.*_gateway\|run_proactivity_gateway\|get_file_chat_gateway" backend -- ':!backend/tests' ':!backend/llm_gateway' ':!backend/testing' ':!backend/evals'`)
+is ported or cut below:
+
+| Callsite | Reachable in the MVP | Disposition |
+| --- | --- | --- |
+| `clients.py:915-923` managed `get_llm` branch | yes: every MVP feature | Ported: the `bedrock` dispatch above returns before it |
+| `clients.py:889-905` BYOK gateway branch | no: the `bedrock` dispatch returns before BYOK resolution | Unreachable under `aws` |
+| `clients.py:952` `get_llm_gateway_chat_structured` | no: imported by `conversation_processing.py:36` but called nowhere | Unreachable |
+| `utils/memory/required_intake.py:56-63` `normalize`, the canonical memory required-intake Flex call (`memory_l2_flex`) | yes: `MEMORY_REQUIRED_INTAKE_ENABLED` defaults on (`config/required_memory_intake.py:17-18`). `POST /v3/memories` writes through `MemoryService._canonical_write` (`memory_service.py:3955-3958`), which marks the item required with `required_processing_payload`, then `write_canonical_external_memory` (`canonical_memory_adapter.py:1933`) reaches `write_canonical_extraction_memory`, which calls `after_capture` (1828) inside its 12 s inline budget. Conversation memory extraction writes through the same function | Ported, see "Flex lanes" below |
+| `utils/memory/promotion_flex.py:41-47` `_get_gateway_flex_llm` and its `.bind(service_tier='flex')` (239) | no: `read_promotion_flex_control` returns the standard control unless `OMI_BACKGROUND_FLEX_CAPABLE` is true (`promotion_flex.py:87-91`, default `false`), and `llm_for_uid` then returns `None` (169-170) | Cut: `OMI_BACKGROUND_FLEX_CAPABLE` stays unset. The router's users (`utils/llm/memories.py:430`, `canonical_consolidation.py:899`, `x_connector.py:41`) keep their standard `get_llm` model, which takes the `bedrock` dispatch |
+| `utils/task_intelligence/workstream_association.py:78` `_default_adjudicator` → `invoke_chat_structured_gateway` (`gateway_client.py:291`) | yes: `process_conversation.py:1945` calls it after memory extraction whenever the owner has an open workstream candidate | Ported: `invoke_chat_structured_gateway` gains the same `bedrock` check. Under the `aws` profile it returns `get_llm('chat_extraction', request_timeout=timeout_seconds, max_retries=0).with_structured_output(output_model).invoke(prompt)` and keeps returning `None` on any model error, so `_default_adjudicator` still answers `model_unavailable` (85) |
+| `utils/other/chat_file.py:419` and `:475`, the `get_file_chat_gateway_async_client` / `_sync_client` file-chat lanes | yes: chat with an attachment | Ported by "Chat files: S3 plus Bedrock content blocks", which replaces both `_ask_files*` paths |
+| `utils/retrieval/tools/perplexity_tools.py:150` `_post_gateway_chat_completion` | yes today: `agentic.py:1694` registers the tool unconditionally | Cut: `OMI_WEB_SEARCH_TOOL=off` (see "Cut switches") |
+| `routers/public_shared_conversation_chat.py:314` | no: the web share page, not the Flutter app | Cut: `OMI_DISABLED_ROUTERS=public_shared_conversation_chat` |
+| `routers/desktop_chat.py:1584`, `:1903` (`POST /v2/chat/completions`) | no: the macOS app only | Cut: `OMI_DISABLED_ROUTERS=desktop_chat` |
+| `utils/llm/app_generator.py:191` `generate_image_via_gateway` | no: `routers/apps.py` only | Cut with the `apps` router |
+| `utils/proactivity.py:82` `run_proactivity_model` → `run_proactivity_gateway` | no: `run_proactivity_model` has no caller at the base commit | Unreachable |
+| `utils/llm/clients.py:441-476` OpenAI embeddings and `:1100-1102` Gemini embeddings gateway | no: `EMBEDDINGS_PROVIDER=bedrock` and the cut index (see "Embeddings") | Unreachable |
+| `utils/llm/gateway_anthropic.py`, `utils/llm/desktop_gemini_gateway.py`, `utils/dream_capacity.py:90`, `utils/dream_harness_transport.py:277` | no: chat-agent gateway route off, desktop proxy, and Dream (routers cut, `DREAM_AGENT_ENABLED` off) | Unreachable |
+
+**Flex lanes.** `required_intake.normalize` asks the gateway for its
+`memory_l2_flex` lane and binds `service_tier='flex'` itself. Bedrock has no
+OpenAI Flex lane, and an unreachable gateway would defer every required memory
+to Dream retry, which the MVP cuts. A new `utils/llm/clients.py::get_flex_llm(feature, *, request_timeout)`
+owns the choice for both Flex callers:
+
+- When `_get_model_config(feature)` names `bedrock`, it returns
+  `get_llm(feature, request_timeout=request_timeout, max_retries=0)` with no
+  `service_tier` bind. The `aws` profile maps `memory_l2_flex` to Haiku.
+- Otherwise it returns today's `get_or_create_omi_gateway_llm(...).bind(service_tier='flex')`.
+
+`required_intake.normalize` and `promotion_flex._get_gateway_flex_llm` call
+`get_flex_llm` and drop their own `.bind(service_tier=...)`, so upstream sends
+the same request as before. The required-intake error classification
+(`required_intake.py:68-76`) also maps botocore's `ReadTimeoutError`,
+`ConnectTimeoutError` and a `ClientError` with code `ThrottlingException`,
+`ServiceUnavailableException` or `ModelNotReadyException` to
+`RequiredProcessingDeferred`, so a Bedrock outage does not spend the
+processor's quality retry budget.
+
+#### Request options at bind time
+
+The provider constructor is not the only place OpenAI arguments enter a
+request. Callers bind request kwargs after `get_llm` returns. For example, the
+chat runner binds `max_completion_tokens=8192` (`agentic.py:1230`).
+`ChatBedrockConverse._stream` camel-cases every bound kwarg and passes it to
+`_converse_params`
+([`bedrock_converse.py:1502-1518`](https://github.com/langchain-ai/langchain-aws/blob/214673ad41997525d12c2c5427431eb0626abb39/libs/aws/langchain_aws/chat_models/bedrock_converse.py#L1502-L1518)),
+whose keyword-only signature accepts `maxTokens`, `tools`, `toolChoice`,
+`serviceTier` and a few others, but not `maxCompletionTokens`, `extraBody` or
+`promptCacheKey`
+([`2048-2071`](https://github.com/langchain-ai/langchain-aws/blob/214673ad41997525d12c2c5427431eb0626abb39/libs/aws/langchain_aws/chat_models/bedrock_converse.py#L2048-L2071)).
+An unknown key raises `TypeError` before any Converse request. `reasoning_effort`
+is popped and validated against the model profile's `reasoning_effort_levels`
+(1265-1290). It is ignored with a warning when the profile declares none, and
+raises `ValueError` when the effort is not one of the declared levels.
+
+**Decision.** Provider-specific request options go through one module,
+`utils/llm/request_options.py`, and no retained path binds an OpenAI-only
+kwarg directly. It unwraps a `RunnableBinding` with `getattr(model, 'bound', model)`,
+as `notes_effort.py:10` already does, and branches on
+`isinstance(underlying, ChatBedrockConverse)`:
+
+| Helper | OpenAI-compatible model (unchanged upstream request) | `ChatBedrockConverse` |
+| --- | --- | --- |
+| `bind_chat_tools(model, tools, *, tool_choice='auto', max_output_tokens, extra_body=None)` | `model.bind(tools=tools, tool_choice=tool_choice, max_completion_tokens=max_output_tokens, **({'extra_body': extra_body} if extra_body else {}))` | `model.bind_tools(tools, tool_choice=tool_choice, max_tokens=max_output_tokens)`. `bind_tools` (1704-1787) converts the OpenAI tool dicts and resolves `'auto'` to `{'auto': {}}`. `max_tokens` becomes `inferenceConfig.maxTokens`. `extra_body` is dropped |
+| `bind_reasoning_effort(model, effort)` | `model.bind(reasoning_effort=effort)` | returns `model` unchanged and records `record_fallback(component='llm_request', from_mode='reasoning_effort', to_mode='model_default', reason='unsupported', outcome='degraded')` |
+| `bind_service_tier(model, tier)` | `model.bind(service_tier=tier)` | returns `model` unchanged |
+| `bind_openai_cache(model, **params)` (`extra_body`, `prompt_cache_key`) | `model.bind(**params)` | returns `model` unchanged |
+
+**Bind and invoke kwargs on the retained LLM paths** (`git grep -n "\.bind(" backend/utils backend/routers`, plus every `model_copy(update=...)` on a chat model, filtered to paths the MVP reaches):
+
+| Site | Kwargs today | Under the `aws` profile |
+| --- | --- | --- |
+| `utils/retrieval/agentic.py:1230` `_run_openai_agent_stream` | `tools`, `tool_choice='auto'`, `max_completion_tokens=8192` | `bind_chat_tools(..., max_output_tokens=8192)` |
+| `utils/retrieval/shaped_chat.py:81-84` `run_shaped_chat_stream` (the chat runner when `OMI_SHAPED_AGENT_MODE=on`, see "Runtime settings") | `tools`, `tool_choice='auto'`, `max_completion_tokens=8192`, and `extra_body` when the GPT-5.6 cache is on | `bind_chat_tools(..., max_output_tokens=8192, extra_body=...)`. `cache_enabled` is already false, because `model_supports_explicit_cache` (`prompt_cache.py:27`) does not match a Bedrock id |
+| `utils/llm/notes_effort.py:31` `bind_notes_effort`, from `conversation_processing.py:570` (`conv_structure` on escalation) | `reasoning_effort='xhigh'` | Its model-name guard (10-14) already returns the model unchanged, because `ChatBedrockConverse.model` (a property over `model_id`, `bedrock_converse.py:754`) is an `au.anthropic.*` id that fails the GPT prefix check. It moves onto `bind_reasoning_effort` so the provider decision has one owner instead of a name match |
+| `utils/llm/shaped_notes_transport.py:71-72` `isolated_notes_model`, around every `conv_structure` notes call (`conversation_processing.py:567`) and `notes_agent_serving.py:180` | n/a. It raises `TypeError` unless the model is `ChatOpenAI` or `ChatAnthropic` | Adds a `ChatBedrockConverse` branch that yields the model unchanged. `ChatBedrockConverse` defines no async methods, so `ainvoke` runs the sync boto3 call in LangChain's executor, and no connection pool is bound to the notes worker's event loop |
+| `utils/llm/wake_word_adjudication.py:163` | `reasoning_effort='high'`, bound because the feature-mode flag is unset | `bind_reasoning_effort` |
+| `utils/memory/required_intake.py:63`, `promotion_flex.py:239` | `service_tier='flex'` | `get_flex_llm` ("Flex lanes") |
+| `utils/llm/prompt_cache.py:139` `with_cache_write_opt_out`, from `utils/llm/chat.py:1235` and `:1342` (metadata extraction in chat) | `extra_body={'prompt_cache_options': ...}`, unless BYOK | `bind_openai_cache`. Today it binds for every managed model |
+| `utils/llm/prompt_cache.py:155` `bind_explicit_cache`, from `proactive_notification.py:452` | `extra_body`, `prompt_cache_key` | `bind_openai_cache` |
+| `utils/llm/clients.py:938-948`, `:976` | `prompt_cache_key`, `extra_body` | Skipped by the early `bedrock` return, and keyed on OpenAI model names |
+| `utils/translation_core/providers.py:102-108` `LunaTranslationProvider.translate` (`viewed_v1` policy) | `model_copy(update={'max_tokens': ..., 'max_output_tokens': ...})`, after `get_model('translation') != self.model_name` (98), where `model_name = LUNA_MODEL` (82) | The identity check compares against `get_model('translation')` resolved at construction, so a Bedrock model is not rejected as `config_incomplete`. The update sets only `max_tokens`, a declared `ChatBedrockConverse` field |
+| `utils/episodes/composer.py:697` | `tools` only | Unchanged. `tools` is a `_converse_params` key, and `_format_tools` (3824) converts OpenAI tool dicts |
+| `utils/memory_ingestion/adapters/production_like_model.py:788` | `temperature` | Unchanged. `temperature` is accepted |
+
+**Message shapes.** The chat runners keep OpenAI message dicts in history: an
+assistant turn with `tool_calls[].function.arguments` as a JSON string, and
+`{'role': 'tool', 'tool_call_id': ..., 'content': ...}` results
+(`agentic.py:1347-1363`, `shaped_chat.py:105-117`). LangChain's message
+conversion turns those into `AIMessage.tool_calls` and `ToolMessage`, which
+`_messages_to_bedrock` emits as `toolUse` and `toolResult` blocks. A system
+message after the first turn (`chat_mount.py:62`) is hoisted into Converse's
+`system` (2668-2685). The runners read text with `openai_content_text`
+(`agentic.py:1118`), which already accepts the list-of-blocks content that
+Converse chunks carry, and tool calls with `openai_tool_calls` (1158), which
+reads `tool_call_chunks`.
+
+**Tests (implementation card).** Every Bedrock test injects a fake
+`bedrock-runtime` client through `ChatBedrockConverse(client=...)` that
+records each `converse` / `converse_stream` call's keyword arguments and
+returns a canned event stream. The fake runs against the `langchain-aws`
+version pinned in both requirement files, so a library change that moves a
+kwarg breaks the test.
+
+- `tests/unit/test_llm_aws_dispatch.py`, with `MODEL_QOS=aws` and
+  `OMI_LLM_GATEWAY_URL` unset: for `chat_agent`, `conv_structure`,
+  `episode_composer`, `translation`, `chat_extraction` and `memory_l2_flex`,
+  invoking `get_llm(feature)` sends exactly one request to the fake Bedrock
+  client with the profile's `au.` model id, and the gateway factories
+  (`get_or_create_omi_gateway_llm`, `get_llm_gateway_client`) are patched to
+  raise, so a call that reaches them fails the test. A second case with
+  `MODEL_QOS` unset asserts the managed branch still calls
+  `get_or_create_omi_gateway_llm` (upstream unchanged). A third sets a BYOK
+  OpenAI key under `aws` and asserts the request still reaches Bedrock.
+- Agent loop, for both `_run_openai_agent_stream` and `run_shaped_chat_stream`:
+  the fake's first `converse_stream` emits a `toolUse` start, two
+  `toolUse` input deltas and `stopReason=tool_use`. The test asserts the
+  first call's `inferenceConfig.maxTokens == 8192` and
+  `toolConfig.toolChoice == {'auto': {}}`, with every chat tool in
+  `toolConfig.tools`, that the runner executed the named tool once with the
+  joined arguments, and that the second call's `messages` holds an assistant
+  `toolUse` block and a user `toolResult` block with the same `toolUseId`.
+  The second call returns text, and the test asserts it reaches
+  `full_response`.
+- `invoke_chat_structured_gateway` under `aws` sends one Bedrock request and
+  no gateway request, and returns `None` when the fake raises.
+- `required_intake.normalize` under `aws` sends one Bedrock request with no
+  `serviceTier`. A botocore `ReadTimeoutError` from the fake raises
+  `RequiredProcessingDeferred`. Upstream, `get_flex_llm` still binds
+  `service_tier='flex'` on the gateway model.
+- `request_options`: each helper's OpenAI branch binds exactly the kwargs in
+  the table, and each `ChatBedrockConverse` branch produces a `converse`
+  request with no `TypeError`. A census test walks the call graph and asserts
+  no retained path calls `.bind(max_completion_tokens=`, `.bind(extra_body=`,
+  `.bind(reasoning_effort=` or `.bind(service_tier=` outside
+  `request_options.py`.
+- `isolated_notes_model` yields a `ChatBedrockConverse` unchanged, and one
+  `get_conversation_notes` call under `aws` reaches the fake.
 
 ### Embeddings: Titan input bound and the cut index
 
@@ -1316,8 +1588,10 @@ The retry calls `self.client.invoke_model` directly, so the pinned
 ### Chat files: S3 plus Bedrock content blocks
 
 `POST /v2/files` and `/v2/files/video` upload attachments to OpenAI Files today
-(`utils/other/chat_file.py:262` and 343), and the answer path calls OpenAI chat
-completions directly (`_ask_files_stream` at 397, `_ask_files` at 462).
+(`utils/other/chat_file.py:262` and 343), and the answer path calls the LLM
+gateway's file-chat lanes (`_ask_files_stream` at 397 through
+`get_file_chat_gateway_async_client`, 419; `_ask_files` at 462 through
+`get_file_chat_gateway_sync_client`, 475).
 
 - Store the bytes in `BUCKET_CHAT_FILES` under `{uid}/files/{file_id}`. Keep
   the `openai_file_id` field on `u/files/{id}` and put the S3 key in it, so the
@@ -1570,21 +1844,69 @@ changes. The header is attached only when the URL's origin equals
 an error it resolves the header once more (the token may have expired since
 the first build) and retries once, then shows the fallback tile.
 
-**Deletion.** `FileChatTool.cleanup` (`utils/other/chat_file.py:619`) works
-from the raw rows without model validation, as `_openai_file_ids` (94) does
-today. It deletes the attachment key, `video.strip_file_id` and
-`thumbnail_key` with one S3 `DeleteObjects` call, then deletes only the rows
-whose objects are gone. A row whose delete failed stays, so the next clear
-retries it. Today a failed provider delete is logged and its row deleted
-anyway (628-636), which orphans the object. Entry points:
+**Deletion.** Today a failed provider delete is logged and its row deleted
+anyway (`utils/other/chat_file.py:628-636`), which orphans the object. Keeping
+the failed row alone does not make a retry possible, because cleanup finds
+rows only through the session's `file_ids` (624-627), and both cascade routes
+delete that session right after cleanup: `DELETE /v2/chat-sessions/{session_id}`
+through `delete_chat_session(cascade_messages=True)` (`database/chat.py:892-910`),
+and the implicit-session branch of `DELETE /v2/messages` through
+`delete_chat_session` (`routers/chat.py:356-357`). The legacy
+`DELETE /v1/messages` (`routers/chat.py:1683-1717`, still mounted, not called
+by the app) does the same at 1714-1715. Once the session is gone,
+nothing points at the surviving rows.
 
-- `DELETE /v2/messages` already calls cleanup (`routers/chat.py:347-350`).
-- `DELETE /v2/chat-sessions/{session_id}` (`routers/chat_sessions.py:172`)
-  does not. It calls `delete_chat_session(cascade_messages=True)`
-  (`database/chat.py:892`), which removes messages but leaves `u/files` rows
-  and their objects. The route must run `FileChatTool(uid, session_id).cleanup()`
-  before the cascade, while the session still lists its `file_ids`.
+**Decision: the file row is the retry pointer.** Cleanup marks a session's
+rows as pending before it touches S3, so the rows stay discoverable after the
+session is deleted:
+
+1. **Claim.** `FileChatTool.cleanup` reads the rows for the session's
+   `file_ids` (raw dicts, no model validation, as `_openai_file_ids` (94)
+   does) and writes `cleanup_pending_at=<now>` on each in one batch. If that
+   write fails, cleanup raises and the route answers 500 before any message,
+   session or object is deleted, so the client's next delete starts over.
+2. **Delete objects.** One S3 `DeleteObjects` call per 1,000 keys, each
+   naming the attachment key, `video.strip_file_id` and `thumbnail_key`, all
+   under `{uid}/`. A key outside `{uid}/` is skipped and its row kept, so a
+   corrupt row cannot delete another user's object.
+3. **Delete rows.** Delete only the rows whose every key came back in
+   `Deleted`, or as `NoSuchKey`. A row with a key in `Errors`, or a whole call
+   that raised, keeps its row and its `cleanup_pending_at`. Cleanup returns
+   the count of kept rows and logs it. It does not raise for a partial S3
+   failure.
+4. **Cascade.** The route then deletes the messages and the session as
+   today. The kept rows no longer need the session to be found.
+
+**Retry owner.** `FileChatTool.retry_pending_cleanup(uid, limit=100)` selects
+the uid's rows with `cleanup_pending_at` set and runs steps 2 and 3 on them.
+It touches only rows that a cleanup claimed, never another session's
+attachments. Both cascade routes call it first, best effort (an error is
+logged and the route continues), so the next chat clear or session delete
+retries earlier failures. Account deletion removes everything left through the
+`{uid}/` prefix purge above.
+
+Entry points:
+
+- `DELETE /v2/messages` already calls cleanup (`routers/chat.py:346-353`).
+  Its order becomes `retry_pending_cleanup` → `clear_chat` → `cleanup` →
+  `delete_chat_session` for the implicit session. The explicit-session branch
+  keeps the session and runs the same cleanup.
+- `DELETE /v2/chat-sessions/{session_id}` (`routers/chat_sessions.py:172-178`)
+  does not call cleanup today, so its rows and objects survive. It becomes
+  `retry_pending_cleanup` → `FileChatTool(uid, session_id).cleanup()` →
+  `delete_chat_session(cascade_messages=True)`. Cleanup must run before the
+  cascade, while the session still lists its `file_ids`.
+- `DELETE /v1/messages` (`routers/chat.py:1683`) takes the same order as the
+  implicit-session `DELETE /v2/messages`. It is mounted with the retained
+  `chat` module, so it must not delete a session without the claim either.
 - Account deletion is covered by the `{uid}/` prefix purge above.
+
+**Rejected: keep the session when cleanup partially fails.** The user asked to
+delete the chat. A kept session stays in `GET /v2/chat-sessions` and the
+history list, and `DELETE /v2/messages` would need a new error the client
+does not handle. **Rejected: a separate cleanup queue table.** The rows
+already hold the keys and the owner, so a second record would duplicate them
+and need its own consistency rule.
 
 **Rejected: a fresh presigned URL on every projection.** The URL is persisted
 in three places the backend does not rewrite on read: the embedded message
@@ -1611,8 +1933,19 @@ the URL's own expiry is later.
   `/v2/desktop/messages` fetches successfully. Its URL carries no signature or
   expiry parameter.
 - Cleanup deletes the attachment, strip and thumbnail objects, then the rows.
-  A failed object delete keeps its row. `DELETE /v2/chat-sessions/{id}` runs
-  cleanup.
+  `DELETE /v2/chat-sessions/{id}` runs cleanup.
+- Partial failure and retry, parametrized over both cascade entries
+  (`DELETE /v2/chat-sessions/{id}`, the implicit-session
+  `DELETE /v2/messages` and `DELETE /v1/messages`): session `S` holds files `f1` and `f2`, and the
+  same uid has file `g` in session `T`. A stubbed S3 client returns `f1`'s
+  keys in `Deleted` and `f2`'s thumbnail key in `Errors`. After the route,
+  `S` and its messages are gone, `f1`'s row is gone, and `f2`'s row exists
+  with `cleanup_pending_at` set. `g`'s row and objects are untouched and
+  unmarked. The next cascade call on `T` first retries: the stub now deletes
+  `f2`'s keys, `f2`'s row is gone, and `g` is handled by `T`'s own cleanup.
+- A failed claim write answers 500, and the session, messages, rows and
+  objects all remain. A row whose key is outside `{uid}/` keeps its row and
+  sends no `DeleteObjects` entry for that key.
 - Against the deployed bucket, an anonymous GET of the object's S3 URL returns
   403 and the stable route returns 401.
 - Flutter widget test (`test/pages/chat/`): an API-origin URL gets the
@@ -1980,7 +2313,8 @@ same gap. None is on the MVP path in `in_process` mode:
   - `local` and `offline` turn GCS writes into no-ops in `utils/other/storage.py`.
   - `dev` costs four effects: it skips Stripe price validation, prefixes sync
     Redis keys and collections with `dev`, turns on stage profiling and parity
-    telemetry, and lets the LLM gateway route features.
+    telemetry, and lets `OMI_LLM_GATEWAY_FEATURE_MODE` take effect without the
+    prod override. That variable stays unset, so the last effect does not apply.
   - This choice is `UNVERIFIED` until the first deploy boots clean.
 - `MEMORY_ENABLED=on`. Memory fails closed when this is unset
   (`config/memory_rollout.py`).
@@ -1995,6 +2329,25 @@ same gap. None is on the MVP path in `in_process` mode:
   `STT_CAP_DISPATCH_ENFORCEMENT=false`.
 - `EMBEDDINGS_PROVIDER=bedrock`, so `utils/llm/clients.py` builds
   `_TitanEmbeddings` as the default embeddings client.
+- `MODEL_QOS=aws`, so every feature resolves to `bedrock` and `get_llm` takes
+  the explicit Bedrock dispatch (see "Managed dispatch: Bedrock before the
+  gateway branch"). The startup check refuses to boot if the name does not
+  resolve to the `aws` profile.
+- `OMI_LLM_GATEWAY_URL`, `OMI_LLM_GATEWAY_SERVICE_TOKEN`,
+  `OMI_LLM_GATEWAY_FEATURE_MODE`, `OMI_LLM_CHAT_AGENT_ROUTE` and
+  `OMI_BACKGROUND_FLEX_CAPABLE` stay unset. No gateway runs, and the "Direct
+  gateway callsites" table shows that no MVP path reaches one.
+- `OMI_SHAPED_AGENT_MODE=on`, as upstream prod sets it
+  (`charts/backend-listen/prod_omi_backend_listen_values.yaml:399-400`,
+  `charts/pusher/prod_omi_pusher_values.yaml:373-374`). With the default
+  `off`, `get_conversation_notes` raises before any model call
+  (`utils/llm/conversation_processing.py:461-462`), so conversation structure
+  fails for every conversation. `on` also makes `POST /v2/messages`, which
+  passes `shaped_invocation=True` (`utils/chat_turn.py:664`), run
+  `utils/retrieval/shaped_chat.py::run_shaped_chat_stream` through
+  `_run_routed_chat_stream` (`agentic.py:1779-1789`, 1394-1395) instead of
+  `_run_openai_agent_stream`. Both runners bind through
+  `request_options.bind_chat_tools`.
 - `COGNITO_USER_POOL_ID=ap-southeast-4_jA7oAYYrp` and
   `COGNITO_REGION=ap-southeast-4` for the user lookup adapter.
 - `REDIS_DB_TLS=true`, `REDIS_DB_HOST` set to the `omi-valkey` primary
@@ -2073,6 +2426,7 @@ method is still mounted on the same path.
 | Frame and photo evidence | `OMI_DISABLED_ROUTERS=frame_requests`, plus `BUCKET_FRAME_REQUESTS*` unset | 404 on `/v1/frame-requests*` and `GET /v1/conversations/{conversation_id}/photos/{photo_id}/image` | The necklace has no camera. The photo cache returns null and shows a placeholder |
 | Screenshots | `OMI_DISABLED_ROUTERS=screen_frames`, plus `BUCKET_SCREEN_FRAMES` unset | 404 on `/v1/conversations/{conversation_id}/screenshots*`, `/v1/conversations/{conversation_id}/shared/screenshots`, `/v1/screen-frame-egress/*` | The detail screenshot section hides on `ApiFailure` (`conversation_screenshots_section.dart:132-135`) |
 | Owner voiceprint | `HOSTED_SPEAKER_EMBEDDING_API_URL` unset (unconfigured, no route) | `utils/stt/speaker_embedding.py:59` returns no embedding | Lower diarization quality |
+| Gateway-only chat routes the app never calls: desktop chat completions (`routers/desktop_chat.py:1969`, `POST /v2/chat/completions`) and the web share page's chat (`routers/public_shared_conversation_chat.py:255`, `POST /v1/conversations/shared/chat`) | `OMI_DISABLED_ROUTERS=desktop_chat,public_shared_conversation_chat` | 404 | None. The Flutter app calls neither (`git grep -n "chat/completions\|shared/chat" app/lib` is empty). Both send every request to the LLM gateway, which the port does not run (see "Direct gateway callsites") |
 | Perplexity web search tool | New `OMI_WEB_SEARCH_TOOL=off`, read where `utils/retrieval/agentic.py:1694` registers the tool. `PERPLEXITY_API_KEY` unset | The tool is not registered, so the model never sees it | Chat answers without web search. Today the tool stays registered and returns an error string |
 | PostHog | `POSTHOG_PRODUCT_CAPTURE_TOKEN`, `POSTHOG_PROJECT_API_KEY`, `POSTHOG_API_KEY` and `POSTHOG_HOST` unset on the backend (`utils/product_telemetry.py:53-81`). The app guards on `Env.posthogApiKey != null` | No events sent | None |
 | LangSmith | `LANGSMITH_TRACING=false`, no `LANGSMITH_API_KEY` (`utils/observability/langsmith.py:26`) | No tracing | None |
@@ -2152,7 +2506,7 @@ described above until updated.
 **Full switch values for the fork:**
 
 ```text
-OMI_DISABLED_ROUTERS=auth,oauth,payment,retention_offer,yearly_switch,redeem_code,storefront,apps,developer,developer_key,phone_calls,messaging,tts,google_calendar,calendar_onboarding,calendar_meetings,x_connector,review,dream_cohort,dream_report,static_map,frame_requests,screen_frames
+OMI_DISABLED_ROUTERS=auth,oauth,payment,retention_offer,yearly_switch,redeem_code,storefront,apps,developer,developer_key,phone_calls,messaging,tts,google_calendar,calendar_onboarding,calendar_meetings,x_connector,review,dream_cohort,dream_report,static_map,frame_requests,screen_frames,desktop_chat,public_shared_conversation_chat
 OMI_DISABLED_ROUTES=GET /authorize;POST /authorize;POST /v1/users/fcm-token;POST /v1/conversations/search;POST /v2/sync-capture-manifest;POST /v1/sync-local-files;POST /v2/sync-local-files;POST /v2/sync-local-files/{job_id}/release-hold;GET /v2/sync-local-files/{job_id};POST /v2/voice-messages;POST /v2/voice-message/transcribe;WS /v2/voice-message/transcribe-stream;GET /v4/speech-profile;POST /v3/upload-audio;GET /v3/speech-profile/expand;DELETE /v3/speech-profile/expand;GET /v3/speech-profile/stt-availability;GET /v1/task-integrations/{app_key}/oauth-url;GET /v1/integrations/{app_key}/oauth-url;POST /v1/conversations/{conversation_id}/calendar-event;DELETE /v1/conversations/{conversation_id}/calendar-event;POST /v1/conversations/{conversation_id}/calendar-event/auto-link
 ```
 

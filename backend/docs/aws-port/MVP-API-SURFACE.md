@@ -94,6 +94,24 @@ and Vector means Pinecone, which is cut: vector reads return empty, and the
 summary-vector writer returns before any embedding call (ADR-001,
 "Embeddings: Titan input bound and the cut index").
 
+**LLM `<feature>`** names a `get_llm(feature)` call (`utils/llm/clients.py:762`)
+unless the row names another seam. Its chain differs before and after the port:
+
+- **Today:** `get_llm` → managed branch (`clients.py:915-923`, taken for every
+  keyless request because `should_route_company_paid_features_through_gateway()`
+  returns `True`, `gateway_client.py:231-239`) →
+  `get_or_create_omi_gateway_llm('omi:auto:<feature>')` → the LLM gateway at
+  `OMI_LLM_GATEWAY_URL` (default `http://127.0.0.1:9080`) → OpenAI
+  `gpt-6-luna`. `OMI_LLM_GATEWAY_FEATURE_MODE` does not change this path.
+- **After the port:** `get_llm` → the `bedrock` dispatch, which returns before
+  BYOK resolution and the gateway branch → `ChatBedrockConverse` with the `aws`
+  profile's `au.` model, in-region. No gateway hop. Bind-time request options
+  go through `utils/llm/request_options.py` (ADR-001, "LLM: Bedrock through
+  `langchain-aws`").
+
+Gateway calls that bypass `get_llm` are named in their rows, with the ADR's
+"Direct gateway callsites" disposition.
+
 ### Shared auth chain (authenticated rows)
 
 This chain applies to every **in** row except the four public routes listed
@@ -331,8 +349,10 @@ JSON segment and event messages.
 5. **Transcript persistence.** `u/conversations/{id}` holds the in-progress
    conversation and its segments. When the session sets a translation
    language, `TranslationService` (`routers/listen/transcripts.py:184`) caches
-   translations in Valkey (`utils/translation_core/cache.py`) and calls the LLM
-   on a miss.
+   translations in Valkey (`utils/translation_core/cache.py`) and calls LLM
+   `translation` on a miss (`utils/translation_core/providers.py:103`). The
+   port also changes that provider's Luna identity check and token-limit
+   update (ADR-001, "Request options at bind time").
 6. **Audio archive.** S3 `BUCKET_PRIVATE_CLOUD_SYNC` and `BUCKET_CANONICAL_AUDIO`.
    Private cloud sync defaults on.
 7. **Usage.** `u/hourly_usage` and `u/llm_usage`. The transcription allowance
@@ -352,7 +372,17 @@ JSON segment and event messages.
    lease and runs `utils/conversations/process_conversation.py::process_conversation`
    (2585) with the LLM features `conv_structure`, `conv_discard`, `conv_folder`,
    `conv_app_select`, `conv_app_result`, `memories` (three passes),
-   `memory_category` and `learnings`. It writes `u/conversations/{id}`
+   `memory_category` and `learnings`, each on the chain in "How to read the
+   chains". `conv_structure` runs `get_conversation_notes`
+   (`utils/llm/conversation_processing.py:454`), which needs
+   `OMI_SHAPED_AGENT_MODE=on` (it raises at 461-462 otherwise) and wraps the
+   model in `isolated_notes_model` (`shaped_notes_transport.py:60`), which
+   gains a `ChatBedrockConverse` branch. After memory extraction,
+   `associate_canonical_evidence` (`process_conversation.py:1945`) calls
+   `invoke_chat_structured_gateway` (`gateway_client.py:291`) when the owner
+   has an open workstream. Today that is a direct gateway call outside
+   `get_llm`. After the port it is the `bedrock` branch of that function,
+   feature `chat_extraction`. It writes `u/conversations/{id}`
    (structured fields), `u/memory_items` and `u/memory_operations`. Pinecone is
    cut, so `save_structured_vector` returns before it embeds or extracts
    metadata, with no Bedrock call. Push is cut, so it
@@ -414,7 +444,7 @@ is cut and becomes a no-op.
 | Method and path | Client caller | Backend handler | Store / providers | MVP |
 | --- | --- | --- | --- | --- |
 | `GET /v3/memories?…cursor` | `backend/http/api/memories.dart:225` `getMemoriesResult` (URL from `buildMemoriesListUrl`, 138), called from `providers/memories_provider_loading.dart:10` | `routers/memories.py:711` | `u/memory_items` (cursor-paged), `u/memory_review_queue` | in |
-| `POST /v3/memories` | `memories.dart:22` `createMemoryServer`, called from `providers/memories_provider_deletion.dart:141` and `pages/onboarding/guided_voice_io.dart:27` | `routers/memories.py:478`, then `MemoryService.create_external_memory` | `u/memory_items`, `u/memory_operations` (transaction). LLM `memory_category` | in |
+| `POST /v3/memories` | `memories.dart:22` `createMemoryServer`, called from `providers/memories_provider_deletion.dart:141` and `pages/onboarding/guided_voice_io.dart:27` | `routers/memories.py:478`, then `MemoryService.create_external_memory` | `u/memory_items`, `u/memory_operations` (transaction). LLM `memory_category`. `_canonical_write` marks the item required (`memory_service.py:3955-3958`), so `required_intake.after_capture` runs one inline `memory_l2_flex` call: today a direct gateway Flex call (`required_intake.py:56-63`), after the port `get_flex_llm` on Bedrock with no service tier | in |
 | `PATCH /v3/memories/{memory_id}` | `memories.dart:459` `editMemoryServer`, called from `providers/memories_provider.dart:136` | `routers/memories.py:1159` | `u/memory_items/{id}`, `u/memory_operations` | in |
 | `PATCH /v3/memories/{memory_id}/visibility?value=…` | `memories.dart:47` `updateMemoryVisibilityServer`, called from `memories_provider.dart:134` | `routers/memories.py:1196` | `u/memory_items/{id}` (`visibility`), `u/memory_operations` | in |
 | `DELETE /v3/memories/{memory_id}` | `memories.dart:382` `deleteMemoryServer`, called from `memories_provider_deletion.dart:83` | `routers/memories.py:1073` | `destructive_operation_gate`, `u/memory_items/{id}`, `u/memory_operations` | in |
@@ -431,10 +461,10 @@ is cut and becomes a no-op.
 | --- | --- | --- | --- | --- |
 | `POST /v2/messages?app_id&chat_session_id` (streaming) | `backend/http/api/messages.dart:258` `sendMessageStreamServer`, called from `providers/message_provider.dart:995` | `routers/chat.py:250`, then `utils/chat_turn.py::run_chat_turn` (829), then `utils/retrieval/graph.py::execute_chat_stream` (227) | See the chain below | in |
 | `GET /v2/messages?chat_session_id&offset&limit` | `backend/http/api/chat_sessions.dart:87` `messages`, called from `providers/chat_history_state.dart:80,130,254`. Legacy loader `messages.dart:80` `getMessagesServer`, called from `chat_history_state.dart:270` | `routers/chat.py:371` | `u/messages`, filtered by `chat_session_id` | in |
-| `DELETE /v2/messages?app_id&chat_session_id` | `messages.dart:115` `clearChatServer`, called from `chat_history_state.dart:312` | `routers/chat.py:322` | `u/messages` (batch delete), `u/chat_sessions/{id}`. `FileChatTool.cleanup` (347-350) deletes the session's `u/files` rows and, after the port, their S3 attachment, filmstrip and thumbnail objects | in |
+| `DELETE /v2/messages?app_id&chat_session_id` | `messages.dart:115` `clearChatServer`, called from `chat_history_state.dart:312` | `routers/chat.py:322` | `u/messages` (batch delete), `u/chat_sessions/{id}`. `FileChatTool.cleanup` (346-353) deletes the session's `u/files` rows and, after the port, their S3 attachment, filmstrip and thumbnail objects. After the port it first retries rows a past cleanup left with `cleanup_pending_at`, claims this session's rows the same way before any S3 delete, and keeps a row whose objects failed to delete, so a later clear retries it after the session is gone (ADR-001, "Private chat thumbnails", Deletion) | in |
 | `POST /v2/initial-message?app_id` | `messages.dart:322` `getInitialAppMessage`, called from `message_provider.dart:1191` and `pages/chat/page.dart:888` | `routers/chat.py:361`, then `utils/chat.py::initial_message_util` (70) | `u/chat_sessions`, `u/messages`, `users/{uid}` (language). LLM `chat_responses` (`utils/llm/chat.py`) | in |
 | `POST /v2/chat-sessions` | `chat_sessions.dart:70` `create`, called from `chat_history_state.dart:153` | `routers/chat_sessions.py:130` | `u/chat_sessions` | in |
-| `DELETE /v2/chat-sessions/{session_id}` | `chat_sessions.dart:80` `delete`, called from `chat_history_state.dart:110` | `routers/chat_sessions.py:172` | `u/chat_sessions/{id}`, `u/messages` with that session id. Today it leaves the session's `u/files` rows and objects behind. After the port it runs `FileChatTool.cleanup` first, as `DELETE /v2/messages` does (ADR-001, "Private chat thumbnails") | in |
+| `DELETE /v2/chat-sessions/{session_id}` | `chat_sessions.dart:80` `delete`, called from `chat_history_state.dart:110` | `routers/chat_sessions.py:172` | `u/chat_sessions/{id}`, `u/messages` with that session id. Today it leaves the session's `u/files` rows and objects behind. After the port it runs `retry_pending_cleanup`, then `FileChatTool.cleanup` (claim rows, delete objects, keep failed rows with `cleanup_pending_at`) before the cascade, as `DELETE /v2/messages` does (ADR-001, "Private chat thumbnails", Deletion) | in |
 | `POST /v2/chat/generate-title` | `chat_sessions.dart:91` `title`, called from `chat_history_state.dart:172` | `routers/chat_sessions.py:345` | LLM via `get_llm`, writes `u/chat_sessions/{id}` (`title`), `u/llm_usage` | in |
 | `POST /v2/files` | `messages.dart:373`, via `providers/message_provider.dart:575` `uploadFiles` from the chat attachment control | `routers/chat.py:1518` | See the upload chain below | in |
 | `POST /v2/files/video` | `messages.dart:396`, same caller for video attachments | `routers/chat_video.py:57` | See the upload chain below | in |
@@ -499,15 +529,25 @@ with its bearer token. That URL never expires, so the copies stored in
    (`chat_db.add_message_to_chat_session`), reads attachments from `u/files`
    and S3 `BUCKET_CHAT_FILES`, and reads history
    (`chat_db.get_cache_aligned_messages`).
-4. **Agent.** `utils/retrieval/agentic.py::_run_openai_agent_stream` calls
-   `get_llm('chat_agent')`. After the port that is Bedrock Converse
-   `au.anthropic.claude-sonnet-4-5-20250929-v1:0`, streamed through
+4. **Agent.** `run_chat_turn` passes `shaped_invocation=True`
+   (`utils/chat_turn.py:664`). With `OMI_SHAPED_AGENT_MODE=on`, the runner selected
+   at `utils/retrieval/agentic.py:1789` is `_run_routed_chat_stream`, which calls
+   `utils/retrieval/shaped_chat.py::run_shaped_chat_stream` (1394-1395). With
+   the mode off it would be `_run_openai_agent_stream` (1216). Both call
+   `get_llm('chat_agent', streaming=True)` and bind tools and an 8192-token
+   output limit. Today that bind is `max_completion_tokens` on the gateway's
+   `omi:auto:chat-agent` lane. After the port the model is Bedrock Converse
+   `au.anthropic.claude-sonnet-4-5-20250929-v1:0`, bound through
+   `request_options.bind_chat_tools` (`toolConfig` with `toolChoice` auto,
+   `inferenceConfig.maxTokens=8192`), and tool calls are read from
    `tool_call_chunks`.
 5. **Tools.** The conversation tools read `u/conversations`. Their vector
    branch, `vector_db.query_vectors` in
    `utils/retrieval/tool_services/conversations.py:330`, is skipped while
-   Pinecone is cut. The memory tools read `u/memory_items`. The calendar, Gmail,
-   Perplexity and app tools report unconfigured.
+   Pinecone is cut. The memory tools read `u/memory_items`. The calendar, Gmail
+   and app tools report unconfigured. The Perplexity web search tool, a direct
+   gateway call today (`perplexity_tools.py:150`), is not registered
+   (`OMI_WEB_SEARCH_TOOL=off`).
 6. **Output.** Streams the reply, writes the AI message to `u/messages`, and
    records `u/llm_usage`. Goal extraction takes a Redis lock
    (`try_acquire_goal_extraction_lock`) and runs LLM `goals`.
@@ -543,6 +583,7 @@ caller is one-shot or user-triggered.
 | Static map | `GET /v1/static-map` | `OMI_DISABLED_ROUTERS=static_map` | One image request per map render. No timer |
 | Frame and photo evidence | `GET /v1/conversations/{conversation_id}/photos/{photo_id}/image`, `/v1/frame-requests*` | `OMI_DISABLED_ROUTERS=frame_requests` | One image request per photo render. The cache returns null |
 | Screenshots | `GET /v1/conversations/{conversation_id}/screenshots` and the other `screen_frames` routes | `OMI_DISABLED_ROUTERS=screen_frames` | One request per detail open. The refresh timer re-arms only after a success |
+| Gateway-only chat (not app-callable) | `POST /v2/chat/completions` (`routers/desktop_chat.py:1969`, macOS app), `POST /v1/conversations/shared/chat` (`routers/public_shared_conversation_chat.py:255`, web share page) | `OMI_DISABLED_ROUTERS=desktop_chat,public_shared_conversation_chat` | None. The Flutter app calls neither. Both forward every request to the LLM gateway, which the port does not run (ADR-001, "Direct gateway callsites") |
 
 **Verification.** ADR-001's cut-switch verification test boots the app with the
 fork's switch values and asserts, for every route in this table, that the route
